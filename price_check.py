@@ -94,24 +94,48 @@ def setup_log_queue_handler(log_queue):
         except Exception:
             pass
 
-def get_cf_cookie_from_nodejs(node_script_path: str, port: int, proxy: Optional[str] = None) -> Optional[Dict]:
-    """执行 Node.js 脚本以获取 Cloudflare cookie"""
-    command = ['node', node_script_path, proxy if proxy else 'null', str(port)]
+import requests
+
+def get_cf_cookie_from_api(port: int, proxy_str: Optional[str] = None) -> Optional[Dict]:
+
+    api_host = c.get_key('cf_host') 
+    api_url = f"http://{api_host}:{port}/cf-clearance-scraper"
+    
+    payload = {
+        "url": "https://www.worten.pt/",
+        "mode": "waf-session"
+    }
+    
+    # 解析传入的 proxy_str (格式预期为 "ip:port:账号:密码")
+    if proxy_str and proxy_str != 'null':
+        parts = proxy_str.split(':')
+        if len(parts) == 4:
+            host, proxy_port, username, password = parts
+            payload["proxy"] = {
+                "host": host,
+                "port": int(proxy_port),
+                "username": username,
+                "password": password
+            }
+        else:
+            logging.error(f"代理格式错误，预期为 ip:port:user:pass, 实际收到: {proxy_str}")
+            return None
+
     try:
-        startupinfo = None
-        creationflags = 0
-        if sys.platform == 'win32':
-            startupinfo = subprocess.STARTUPINFO()
-            startupinfo.dwFlags |= subprocess.STARTF_USESHOWWINDOW
-            startupinfo.wShowWindow = subprocess.SW_HIDE
-            creationflags = 0x08000000 
-        result = subprocess.run(
-            command, capture_output=True, text=True, encoding='utf-8', check=True, timeout=90, 
-            startupinfo=startupinfo, creationflags=creationflags
+        response = requests.post(
+            api_url,
+            json=payload,
+            headers={'Content-Type': 'application/json'},
+            timeout=90
         )
-        return json.loads(result.stdout.strip())
-    except Exception as e:
-        logging.error(f"Node.js execution failed: {e}")
+        response.raise_for_status()
+        return response.json()
+        
+    except requests.exceptions.RequestException as e:
+        err_msg = str(e)
+        if hasattr(e, 'response') and e.response is not None:
+            err_msg = f"{e.response.status_code} - {e.response.text}"
+        logging.error(f"请求 CF API 失败 [端口 {port}]: {err_msg}")
         return None
 
 def close_cookie_pup(driver: uc.Chrome):
@@ -262,11 +286,11 @@ def session_producer(session_queue, url_queue, node_script_path, stop_flag, port
     while not stop_flag.value:
         try:
             if session_queue.qsize() < int(MAX_WORKERS / 2 + shutdown_buffer):
-                session_id = ''.join(random.choices(string.ascii_letters + string.digits, k=8))
-                full_user = f"{c.get_key('PROXY_USER_BASE')}{session_id}"
+                session_id = ''.join(random.choices(string.ascii_letters, k=12))
+                full_user = f"{c.get_key('PROXY_USER_BASE')}-country-PT-sid-{session_id}-stime-60"
                 proxy_node = f"{c.get_key('PROXY_HOST')}:{c.get_key('PROXY_PORT')}:{full_user}:{c.get_key('PROXY_PASS')}"
                 proxy_wire = f"http://{full_user}:{c.get_key('PROXY_PASS')}@{c.get_key('PROXY_HOST')}:{c.get_key('PROXY_PORT')}"
-                session_data = get_cf_cookie_from_nodejs(node_script_path, port, proxy_node)
+                session_data = get_cf_cookie_from_api(port, proxy_node)
                 if session_data and "cookies" in session_data:
                     session_data['proxy_for_selenium_wire'] = proxy_wire
                     session_data['created_at'] = time.time()

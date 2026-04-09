@@ -95,24 +95,48 @@ def setup_log_queue_handler(log_queue):
         except Exception:
             pass
 
-def get_cf_cookie_from_nodejs(node_script_path: str, port: int, proxy: Optional[str] = None) -> Optional[Dict]:
-    """执行 Node.js 脚本以获取 Cloudflare cookie"""
-    command = ['node', node_script_path, proxy if proxy else 'null', str(port)]
+import requests
+
+def get_cf_cookie_from_api(port: int, proxy_str: Optional[str] = None) -> Optional[Dict]:
+
+    api_host = c.get_key('cf_host') 
+    api_url = f"http://{api_host}:{port}/cf-clearance-scraper"
+    
+    payload = {
+        "url": "https://www.worten.pt/",
+        "mode": "waf-session"
+    }
+    
+    # 解析传入的 proxy_str (格式预期为 "ip:port:账号:密码")
+    if proxy_str and proxy_str != 'null':
+        parts = proxy_str.split(':')
+        if len(parts) == 4:
+            host, proxy_port, username, password = parts
+            payload["proxy"] = {
+                "host": host,
+                "port": int(proxy_port),
+                "username": username,
+                "password": password
+            }
+        else:
+            logging.error(f"代理格式错误，预期为 ip:port:user:pass, 实际收到: {proxy_str}")
+            return None
+
     try:
-        startupinfo = None
-        creationflags = 0
-        if sys.platform == 'win32':
-            startupinfo = subprocess.STARTUPINFO()
-            startupinfo.dwFlags |= subprocess.STARTF_USESHOWWINDOW
-            startupinfo.wShowWindow = subprocess.SW_HIDE
-            creationflags = 0x08000000 
-        result = subprocess.run(
-            command, capture_output=True, text=True, encoding='utf-8', check=True, timeout=90, 
-            startupinfo=startupinfo, creationflags=creationflags
+        response = requests.post(
+            api_url,
+            json=payload,
+            headers={'Content-Type': 'application/json'},
+            timeout=90
         )
-        return json.loads(result.stdout.strip())
-    except Exception as e:
-        logging.error(f"Node.js execution failed: {e}")
+        response.raise_for_status()
+        return response.json()
+        
+    except requests.exceptions.RequestException as e:
+        err_msg = str(e)
+        if hasattr(e, 'response') and e.response is not None:
+            err_msg = f"{e.response.status_code} - {e.response.text}"
+        logging.error(f"请求 CF API 失败 [端口 {port}]: {err_msg}")
         return None
 
 def close_cookie_pup(driver: uc.Chrome):
@@ -278,12 +302,12 @@ def session_producer(session_queue, url_queue, node_script_path, stop_flag, port
     while not stop_flag.value:
         try:
             if session_queue.qsize() < int(MAX_WORKERS / 2 + shutdown_buffer):
-                session_id = ''.join(random.choices(string.ascii_letters + string.digits, k=8))
-                full_user = f"{c.get_key('PROXY_USER_BASE')}{session_id}"
+                session_id = ''.join(random.choices(string.ascii_letters, k=12))
+                full_user = f"{c.get_key('PROXY_USER_BASE')}-country-PT-sid-{session_id}-stime-60"
                 proxy_node = f"{c.get_key('PROXY_HOST')}:{c.get_key('PROXY_PORT')}:{full_user}:{c.get_key('PROXY_PASS')}"
                 proxy_wire = f"http://{full_user}:{c.get_key('PROXY_PASS')}@{c.get_key('PROXY_HOST')}:{c.get_key('PROXY_PORT')}"
                 
-                session_data = get_cf_cookie_from_nodejs(node_script_path, port, proxy_node)
+                session_data = get_cf_cookie_from_api(port, proxy_node)
                 if session_data and "cookies" in session_data:
                     session_data['proxy_for_selenium_wire'] = proxy_wire
                     session_data['created_at'] = time.time()
@@ -363,73 +387,79 @@ def scrape_other_sellers_logic(driver: uc.Chrome, product_url: str) -> List[Dict
             if attempt == MAX_RETRIES - 1:
                 return [] # 没有更多卖家
     
-    # 3. 等待卖家卡片加载
+    # 3. 等待真实的卖家卡片加载（排除骨架屏/Loading状态）
     try:
-        WebDriverWait(driver, 10).until(
-            EC.visibility_of_element_located((By.CSS_SELECTOR, "article.seller-card"))
+        # 使用 CSS 伪类 :not 排除 loading 卡片
+        WebDriverWait(driver, 15).until(
+            EC.presence_of_element_located((By.CSS_SELECTOR, "article.seller-card:not(.seller-card--loading)"))
         )
+        time.sleep(1) # 给前端框架 1 秒钟的缓冲时间完成最终 DOM 渲染
     except TimeoutException:
         if clicked_more_sellers:
-            logging.warning("   -> 点击后未加载出卖家列表。")
+            logging.warning("   -> 点击后未加载出真实卖家列表（或一直在loading）。")
         else:
-            logging.debug("   -> 页面上没有卖家列表。")
+            logging.debug("   -> 页面上没有真实卖家列表。")
         return []
 
     # 4. 抓取所有卖家卡片
     try:
-        seller_cards = driver.find_elements(By.CSS_SELECTOR, "article.seller-card")
+        # 获取真实卡片总数（必须排除 loading）
+        initial_cards = driver.find_elements(By.CSS_SELECTOR, "article.seller-card:not(.seller-card--loading)")
+        cards_count = len(initial_cards)
         
-        for card in seller_cards:
+        for i in range(cards_count):
             seller_info = {
                 "店铺名称": "N/A", "链接": "N/A",
                 "店铺运费": "N/A", "送货时间": "N/A"
             }
             try:
-                # Type 2 (Worten 自营)
+                # 重新获取真实卡片
+                fresh_cards = driver.find_elements(By.CSS_SELECTOR, "article.seller-card:not(.seller-card--loading)")
+                if i >= len(fresh_cards):
+                    break
+                    
+                card = fresh_cards[i]
+
+                # 强制将当前卡片滚动到页面中央
+                driver.execute_script("arguments[0].scrollIntoView({block: 'center'});", card)
+                time.sleep(0.5) 
+
+                # --- 1. 判断并提取：店铺名称和链接 ---
                 name_elements_t2 = card.find_elements(By.CSS_SELECTOR, ".seller-card__name")
+                link_elements_t1 = card.find_elements(By.CSS_SELECTOR, ".seller-card__seller a")
+                
                 if name_elements_t2:
-                    seller_info['店铺名称'] = name_elements_t2[0].text.strip()
+                    # 匹配到 Worten 自营
+                    seller_info['店铺名称'] = name_elements_t2[0].get_attribute('textContent').strip()
                     seller_info['链接'] = BASE_URL
-                    seller_info['店铺运费'] = '€0.00' 
+                    seller_info['店铺运费'] = '€0.00'
+                elif link_elements_t1:
+                    # 匹配第三方卖家 Marketplace
+                    seller_info['店铺名称'] = link_elements_t1[0].get_attribute('textContent').strip()
+                    href = link_elements_t1[0].get_attribute('href')
+                    seller_info['链接'] = urljoin(BASE_URL, href) if href else "N/A"
+                    
+                    # 提取第三方运费
+                    shipping_elements = card.find_elements(By.CSS_SELECTOR, ".seller-card__shipping--price")
+                    if shipping_elements:
+                        shipping_text = shipping_elements[0].get_attribute('textContent').strip()
+                        shipping_value = parse_price(shipping_text)
+                        seller_info['店铺运费'] = f"€{shipping_value:.2f}" if shipping_value is not None else shipping_text
                 else:
-                    # Type 1 (Marketplace)
-                    # 尝试多种选择器获取名称
-                    for attempt in range(5):
-                        name_elements_t1 = card.find_elements(By.CSS_SELECTOR, "a[class*='seller-card__link'] span")
-                        if not name_elements_t1:
-                            name_elements_t1 = card.find_elements(By.CSS_SELECTOR, "div.seller-card__seller > a > span")
-                                                   
-                        if name_elements_t1:
-                            seller_info['店铺名称'] = name_elements_t1[0].text.strip()
-                            break
-                        time.sleep(random.uniform(1,2))
-
-                    link_elements_t1 = card.find_elements(By.CSS_SELECTOR, "div.seller-card__seller > a")
-                    if link_elements_t1:
-                        href = link_elements_t1[0].get_attribute('href')
-                        seller_info['链接'] = urljoin(BASE_URL, href) if href else "N/A"
-
-                    # Shipping cost
-                    for attempt in range(5):
-                        shipping_elements_t1 = card.find_elements(By.CSS_SELECTOR, "span[class*='seller-card__shipping--price'] span[class*='price__numbers']")
-                        if shipping_elements_t1:
-                            shipping_value = parse_price(shipping_elements_t1[0].text.strip())
-                            seller_info['店铺运费'] = f"€{shipping_value:.2f}" if shipping_value is not None else "N/A"
-                            break
-                        time.sleep(random.uniform(1,2))
-
-                    # Delivery time
-                    for attempt in range(5):
-                        delivery_elements = card.find_elements(By.CSS_SELECTOR, "span[class='neu-07'] span[class='neu-11']")
-                        if delivery_elements:
-                            seller_info['送货时间'] = delivery_elements[0].text.strip()
-                            break
-                        time.sleep(random.uniform(1,2))
-                        
+                    html_content = card.get_attribute('outerHTML')
+                    logging.warning(f"第 {i+1} 个卡片未能提取到名称，其实际HTML为: {html_content[:800]}")
+                    seller_info['店铺名称'] = "提取失败(请查看日志)"
+                
+                # --- 2. 提取：送货时间 ---
+                delivery_elements = card.find_elements(By.CSS_SELECTOR, "span.neu-11")
+                if delivery_elements:
+                    seller_info['送货时间'] = delivery_elements[-1].get_attribute('textContent').strip()
+                    
                 other_sellers_list.append(seller_info)
 
             except Exception as e:
-                pass # 单个卡片失败忽略
+                logging.warning(f"   -> 处理第 {i+1} 个卖家卡片时发生系统错误: {str(e)}")
+                continue
 
     except Exception as e:
         logging.error(f"   -> 抓取卖家信息整体出错: {e}")

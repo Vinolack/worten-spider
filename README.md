@@ -26,28 +26,19 @@
     │
     ├── product_info.py                    <-- 你的Python脚本
     ├── input_links.xlsx
-    └── index.js
+
 
 **2. 添加证书**
 
 将文件夹中的`ca.crt`证书导入Chrome浏览器中：`设置` -> `隐私与安全` -> `管理证书` -> `使用从操作系统导入的本地证书`
 
-**3. 安装node环境**
-
-1.  安装[node.js](https://nodejs.org/en/download/current)
-2.  安装依赖：打开终端，运行以下指令
-    bash
-    ```
-    npm update
-    npm install
-    ```
 
 **4. 填写config配置文件**
 * SELLER_SCRAPED_PAGE_COUNT = 1                             #爬取店铺链接或者类目链接时默认爬取的最大页码
 * IMAGE_HOST_UPLOAD_URL = ""                                #图床地址
 * IMAGE_TOKEN = ""                                          #图床密钥
 * PROXY_HOST = ""                                           #IP池配置
-* PROXY_PORT = 7778
+* PROXY_PORT = 
 * PROXY_USER_BASE = ""
 * PROXY_PASS = ""                                           
 * MAX_WORKER = 1                                            #最大并发进程数
@@ -60,26 +51,14 @@
 **程序打包**
 bash
 ```
-pyinstaller --noconfirm --onedir --windowed --clean --name "Worten商品信息爬虫工具" `
->> --add-data "cft;cft" --add-data "node_modules;node_modules" `
->> --add-data "config.toml;." --add-data "index.js;." `
->> --add-data "request.js;." --add-data "ca.crt;seleniumwire" `
->> worten_gui.py
+pyinstaller --noconfirm --onedir --windowed --clean --name "Worten商品信息爬虫工具" --add-data "cft;cft" --add-data "config.toml;." --add-data "ca.crt;seleniumwire" worten_gui.py
 
 ```
 
 ```
-pyinstaller --noconfirm --onedir --windowed --clean --name "Worten价格检查爬虫工具" `
->> --add-data "cft;cft" --add-data "node_modules;node_modules" `
->> --add-data "config.toml;." --add-data "index.js;." `
->> --add-data "request.js;." --add-data "ca.crt;seleniumwire" `
->> price_check_gui.py
+pyinstaller --noconfirm --onedir --windowed --clean --name "Worten价格检查爬虫V2" --add-data "cft;cft" --add-data "config.toml;." --add-data "ca.crt;seleniumwire" price_check_gui.py
 ```
 
 ```
-pyinstaller --noconfirm --onedir --windowed --clean --name "Worten跟卖信息爬虫工具" `
->> --add-data "cft;cft" --add-data "node_modules;node_modules" `
->> --add-data "config.toml;." --add-data "index.js;." `
->> --add-data "request.js;." --add-data "ca.crt;seleniumwire" `
->> more_seller_gui.py
+pyinstaller --noconfirm --onedir --windowed --clean --name "Worten跟卖信息爬虫V2" --add-data "cft;cft" --add-data "config.toml;." --add-data "ca.crt;seleniumwire" more_seller_gui.py
 ```
