@@ -365,29 +365,77 @@ def navigate_with_retries(driver: uc.Chrome, url: str, max_attempts: int = 3, ba
     return False
        
 # ---  Image Download and Upload Functions ---
-def download_image(url: str, timeout: int = 30) -> Optional[str]:
+def download_image(url: str, proxy_str: str = None, timeout: int = 30) -> Optional[str]:
+    """
+    增强版图片下载：
+    1. 尝试裸连下载
+    2. 如果报错，尝试使用代理下载
+    3. 超过重试次数后返回 None
+    """
     image_dir = IMAGE_PATH
+    
+    # 统一转换代理格式为 requests 要求的格式
+    # 如果传入的是 "ip:port:user:pass"，则转换为 "http://user:pass@ip:port"
+    formatted_proxies = None
+    if proxy_str:
+        if "://" in proxy_str:
+            formatted_proxies = {"http": proxy_str, "https": proxy_str}
+        else:
+            parts = proxy_str.split(':')
+            if len(parts) == 4:
+                host, port, user, pw = parts
+                proxy_url = f"http://{user}:{pw}@{host}:{port}"
+                formatted_proxies = {"http": proxy_url, "https": proxy_url}
+
     for attempt in range(MAX_RETRIES):
+        # --- 第一步：尝试裸连下载 ---
         try:
+            logging.debug(f"[图片下载] 尝试裸连 (第 {attempt+1} 次): {url}")
             response = requests.get(
                 url,
-                headers={'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/58.0.3029.110 Safari/537.3'},
-                timeout=timeout
+                headers={'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36'},
+                timeout=timeout,
+                verify=False # 忽略 SSL 错误，防止协议冲突导致崩溃
             )
             response.raise_for_status()
-            path = urlsplit(url).path
-            ext = os.path.splitext(path)[1]
-            filename = f"{uuid.uuid4()}{ext or '.jpg'}"
-            save_path = os.path.join(image_dir, filename)
-            with open(save_path, 'wb') as f:
-                f.write(response.content)
-            return save_path
-        except requests.exceptions.RequestException as e:
-            logging.info(f"[图片下载重试 {attempt+1}/{MAX_RETRIES}] {url} - {e.__class__.__name__}")
-            if attempt == MAX_RETRIES - 1:
-                logging.error(f"下载失败: {url} - {e}")
-                return None
-            time.sleep(2 ** attempt)
+            return _save_to_disk(url, response.content, image_dir)
+            
+        except Exception as e_bare:
+            logging.info(f"[图片裸连失败] {url} - 错误: {str(e_bare)}")
+            
+            # --- 第二步：如果裸连失败且有代理，尝试代理下载 ---
+            if formatted_proxies:
+                try:
+                    logging.debug(f"[图片下载] 尝试代理: {url}")
+                    response = requests.get(
+                        url,
+                        headers={'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36'},
+                        proxies=formatted_proxies,
+                        timeout=timeout,
+                        verify=False
+                    )
+                    response.raise_for_status()
+                    return _save_to_disk(url, response.content, image_dir)
+                except Exception as e_proxy:
+                    logging.error(f"[图片代理下载也失败] {url} - 错误: {str(e_proxy)}")
+            
+        # --- 第三步：判断是否需要重试 ---
+        if attempt == MAX_RETRIES - 1:
+            logging.error(f"❌ 图片下载彻底失败 (已达最大重试次数): {url}")
+            return None
+            
+        # 指数退避等待
+        time.sleep(2 ** attempt)
+
+def _save_to_disk(url, content, image_dir):
+    """辅助函数：保存二进制内容到本地"""
+    path = urlsplit(url).path
+    ext = os.path.splitext(path)[1]
+    filename = f"{uuid.uuid4()}{ext or '.jpg'}"
+    save_path = os.path.join(image_dir, filename)
+    with open(save_path, 'wb') as f:
+        f.write(content)
+    return save_path
 
 def upload_to_image_host(file_path: str) -> Optional[str]:
     for attempt in range(MAX_RETRIES):
@@ -499,258 +547,151 @@ def scrape_sellers_from_page(driver: uc.Chrome, product_url: str) -> List[Dict]:
         
     return all_sellers_for_this_product
 
-def scrape_product_details(driver: uc.Chrome, product_url: str) -> Optional[Dict]:
+def scrape_product_details(driver: uc.Chrome, product_url: str, proxy_str: str = None) -> Optional[Dict]:
     """
-    访问单个商品页面，验证页面有效性，然后抓取其详细信息。
+    针对 EAN/SKU、描述及复杂运费逻辑优化的抓取函数
     """
-    logging.debug(f"   -> 正在抓取商品详情: {product_url}")
-    details = {}
-    
-    title_selector = "h1[class='product-header__title'] span"
+    logging.debug(f"   -> 正在启动高级抓取: {product_url}")
+    details = {
+        "标题": "N/A", "产品评分": "N/A", "类目": "N/A", "价格": "N/A", 
+        "销售和发货方": "N/A", "运费": "N/A", "EAN": "N/A", "SKU": "N/A", 
+        "品牌": "N/A", "描述": "N/A"
+    }
 
-    if not navigate_with_retries(driver, product_url, max_attempts=5):
-        logging.error(f"[FAILED] 页面导航失败: {product_url} ")
+    if not navigate_with_retries(driver, product_url, max_attempts=3):
         return {"_status": "page_load_failed"}
 
-    # 额外检测：404 页面
-    try:
-        time.sleep(random.uniform(2,4))
-        err404 = driver.find_elements(By.CSS_SELECTOR, ".error404__title")
-        if err404 and err404[0].is_displayed():
-            logging.info(f"页面显示 404 标题，判定为失效链接: {product_url}")
-            return {"_status": "invalid"}
-    except Exception:
-        pass
+    # 1. 基础页面判定
+    time.sleep(random.uniform(2, 3))
+    if driver.find_elements(By.CSS_SELECTOR, ".error404__title"):
+        return {"_status": "invalid"}
     
     close_cookie_pup(driver)
 
-    # 等待页面核心元素出现
-    for attempt in range(2):
-        try:
-            WebDriverWait(driver, PAGE_NAVIGATION_TIMEOUT).until(
-                EC.presence_of_element_located((By.CSS_SELECTOR, title_selector))
-            )
-            break  
-        except TimeoutException:
-            driver.execute_script("window.stop();")
-            if attempt == 1:
-                logging.error(f"[FAILED] 页面导航失败: {product_url} (等待核心元素超时)。")
-                return {"_status": "page_load_failed"}
-        
-
-    # Handle adult content pop-up (成人弹窗处理)
+    # 2. 等待主框架加载
     try:
-        close_button_selector = ".checkYes.button.button--primary.button--black.button--md"
-        close_btn = WebDriverWait(driver, 5).until(
-            EC.element_to_be_clickable((By.CSS_SELECTOR, close_button_selector))
-        )
-        driver.execute_script("arguments[0].click();", close_btn)
-    except TimeoutException:
-        pass
+        WebDriverWait(driver, 20).until(EC.presence_of_element_located((By.CSS_SELECTOR, "h1.product-header__title")))
+    except:
+        return {"_status": "page_load_failed"}
 
-    # --- 解析数据逻辑 ---
+    # ================== 1. 运费抓取  ==================
     try:
-        # 1. Title
-        title_element = driver.find_element(By.CSS_SELECTOR, title_selector)
-        details["标题"] = title_element.text.strip() if title_element else "N/A"
-
-        # 2. Rating
-        try:
-            rating_el = driver.find_element(By.CSS_SELECTOR, "div.rating--s.rating.product-header__rating > span.rating__star-value.semibold > span")
-            details["产品评分"] = rating_el.text.strip()
-        except NoSuchElementException:
-            details["产品评分"] = "N/A"
-
-        # 3. Category
-        category_selector = "ol.breadcrumbs__wrapper span.breadcrumbs__item__name"
-        category_elements = driver.find_elements(By.CSS_SELECTOR, category_selector)
-        if category_elements:
-            cat_texts = [el.text.strip() for el in category_elements if el.text.strip()]
-            details["类目"] = "/".join(cat_texts)
-
-        # --- 4. Images ---
-        image_urls = []
-        local_image_paths = []
-        try:
-            img_elements = driver.find_elements(By.CSS_SELECTOR, "img.product-gallery__slider-image")
-            for img in img_elements:
-                src = img.get_attribute('src')
-                if src:
-                    image_urls.append(urljoin(BASE_URL, src))
-            
-            successful_count = 0
-
-            for url in image_urls:
-                # 如果已经填满了5张图，提前结束
-                if successful_count >= 5:
-                    break
-                    
-                local_path = download_image(url)
-                if local_path:
-                    uploaded_url = upload_to_image_host(local_path)
-                    if uploaded_url:
-                        successful_count += 1
-                        # 始终填入当前顺位的列，避免留空
-                        details[f"图{successful_count}"] = uploaded_url
-                        local_image_paths.append(local_path)
-                    else:
-                        # 如果上传失败，删除本地文件，尝试下一张
-                        try: os.remove(local_path)
-                        except: pass
-                else:
-                    logging.warning(f"图片下载失败，跳过: {url}")
-        finally:
-            # Clean up local images
-            for path in local_image_paths:
-                try:
-                    if os.path.exists(path):
-                        os.remove(path)
-                except Exception as e:
-                    logging.warning(f"无法删除本地图片 {path}: {e}")
-
-        # 5. Price, Seller, Shipping
-        try: details["价格"] = driver.find_element(By.CSS_SELECTOR, "span[class='price--lg price--mixed price--B price'] span[class='price__numbers--bold price__numbers notranslate raised-decimal price__numbers--bold price__numbers']").text.strip()
-        except: details["价格"] = "N/A"
-        
-        try: details["销售和发货方"] = driver.find_element(By.CSS_SELECTOR, "a[class='product-price-info__link font-m bold button--md button--link button--black button product-price-info__link font-m bold w-app-link product-price-info__link font-m bold button--md button--link button--black button product-price-info__link font-m bold'] span").text.strip()
-        except: details["销售和发货方"] = "N/A"
-        
-        # 运费获取
         shipping_found = False
-        for _ in range(10): 
-            shipping_text = None
-            try:
-                shipping_elem = driver.find_element(By.CSS_SELECTOR, ".add-07")
-                if shipping_elem.is_displayed(): shipping_text = shipping_elem.text.strip()
-            except: pass
-
-            if not shipping_text:
-                try:
-                    shipping_elem = driver.find_element(By.CSS_SELECTOR, ".bold.notranslate.bold")
-                    if shipping_elem.is_displayed(): shipping_text = shipping_elem.text.strip()
-                except: pass
-
-            if shipping_text:
-                details["运费"] = shipping_text.replace(',', '.')
-                shipping_found = True
-                break
-            time.sleep(1) # 缩短内部等待
-
+        # 策略 A:  lead-time-box 结构
+        lt_box = driver.find_elements(By.CSS_SELECTOR, ".lead-time-box__price, .lead-time-box__option")
+        if lt_box:
+            for box in lt_box:
+                txt = box.get_attribute('textContent').strip()
+                if "€" in txt or "Grátis" in txt:
+                    details["运费"] = txt.replace('Desde', '').strip().replace(',', '.')
+                    shipping_found = True
+                    break
+        
+        # 策略 B: 传统加粗价格或文字 (Grátis)
         if not shipping_found:
-            details["运费"] = "N/A"
-        
-        # 6. EAN/SKU/Desc/Brand  
-        details["EAN"], details["SKU"], details["品牌"] = "N/A", "N/A", "N/A"
-        time.sleep(random.uniform(2,4)) # Wait before interacting with modal
-        try:
-            # 打开模态框
-            for attempt in range(3):
-                try:
-                    tech_bth = WebDriverWait(driver, 60).until(
-                        EC.element_to_be_clickable((By.CSS_SELECTOR, 'div[class="technical-specifications"] button[class="action-list--vertical-spacious action-list"]'))
-                    )
-                    driver.execute_script("arguments[0].click();", tech_bth)
-                    break
-                except TimeoutException:
-                    # 尝试备用路径
-                    try:
-                        sub_tech_bth = WebDriverWait(driver, 60).until(
-                            EC.element_to_be_clickable((By.XPATH, '//span[normalize-space()="Características técnicas"]'))
-                        )
-                        driver.execute_script("arguments[0].click();", sub_tech_bth)
+            ship_selectors = [".bold.notranslate.bold", ".add-07", ".product-price-info__shipping"]
+            for selector in ship_selectors:
+                elements = driver.find_elements(By.CSS_SELECTOR, selector)
+                for el in elements:
+                    t = el.get_attribute('textContent').strip()
+                    if t and any(c.isdigit() or "Grátis" in t for c in t):
+                        details["运费"] = t.replace(',', '.')
+                        shipping_found = True
                         break
-                    except TimeoutException:
-                        if attempt == 2:
-                            break
-                    time.sleep(2) # Wait before retrying
-
-            # Wait for modal to appear
-            WebDriverWait(driver, ELEMENT_WAIT_TIMEOUT).until(
-                EC.visibility_of_element_located((By.CSS_SELECTOR, ".table-specifications"))
-            )
-            rows = driver.find_elements(By.CSS_SELECTOR, ".table-specifications__row")
-            for row in rows:
-                try:
-                    key = row.find_element(By.CSS_SELECTOR, "p.table__subtitle").text.strip()
-                    value = row.find_element(By.CSS_SELECTOR, ".table-specifications__right-container span").text.strip()
-                    if key == "EAN": details["EAN"] = value
-                    elif key == "Referência": details["SKU"] = value
-                    elif key == "Marca": details["品牌"] = value
-                except:
-                    continue
-            
-            # Close modal
-            for attempt in range(3):
-                try:
-                    modal_close_selector = "div[aria-hidden='false'] button[class='button--md button--tertiary button--black button--icon-right button'] span"
-                    modal_close_bth = WebDriverWait(driver, 30).until(
-                        EC.element_to_be_clickable((By.CSS_SELECTOR, modal_close_selector))
-                    )
-                    time.sleep(random.uniform(2,4)) # Allow modal to fully load
-                    driver.execute_script("arguments[0].click();", modal_close_bth)
-                    break
-                except TimeoutException:
-                    if attempt == 2:
-                        raise
-                    time.sleep(2) # Wait before retrying
-    
-        except TimeoutException:
-            logging.warning("未找到技术规格模态框。")
-        except Exception as e:
-            logging.error(f"抓取 EAN/SKU/品牌时出错: {e}")
-
-        # --- 7. Description ---
-        details["描述"] = "N/A"
-        time.sleep(random.uniform(2,4)) # Wait before interacting with modal
-        try:
-            try:
-                # Open description modal
-                description_selector = 'div[class="about-product"] button[class="action-list--vertical-spacious action-list"]'
-                desc_bth = WebDriverWait(driver, 50).until(   
-                    EC.element_to_be_clickable((By.CSS_SELECTOR, description_selector))
-                )
-                driver.execute_script("arguments[0].click();", desc_bth)
-            except TimeoutException:
-                # 尝试备用路径
-                description_selector = '//span[normalize-space()="Sobre o produto"]'
-                sub_desc_bth = WebDriverWait(driver, 30).until(   
-                    EC.element_to_be_clickable((By.XPATH, description_selector))
-                )
-                driver.execute_script("arguments[0].click();", sub_desc_bth)
-
-            # Wait for modal to appear
-            WebDriverWait(driver, 30).until(
-                EC.visibility_of_element_located((By.XPATH, "//div[@aria-hidden='false']//h2[@id='modalTitle']"))
-            )
-            try:
-                desc_part1 = driver.find_element(By.CSS_SELECTOR, ".font-m.bold.h-mb-1").text.strip()
-            except NoSuchElementException:
-                desc_part1 = ""
-
-            try:
-                desc_part2 = driver.find_element(By.CSS_SELECTOR, "div.rich-text-wrapper div.ql-editor").text.strip()
-            except NoSuchElementException:
-                desc_part2 = ""
-
-            details["描述"] = "\n".join(filter(None, [desc_part1, desc_part2]))
-            #  Close modal
-            close_desc_selector = "//div[@class='about-product']//header[@class='neu-01-bg modal__header']//span[1]"
-            close_desc_bth = WebDriverWait(driver, 10).until(
-                EC.element_to_be_clickable((By.XPATH, close_desc_selector))
-            )
-            time.sleep(random.uniform(2,4)) # Allow modal to close
-            driver.execute_script("arguments[0].click();", close_desc_bth)
-            
-        except TimeoutException:
-            logging.warning("未找到描述模态框。")     
-        except Exception as e:
-            logging.error(f"关闭描述模态框时出错: {e}")
-        
-        return details
-
+                if shipping_found: break
     except Exception as e:
-        logging.error(f"解析页面元素时出错 {product_url}: {e}")
-        return details
+        logging.warning(f"运费抓取异常: {e}")
+
+    # ================== 2. 基础信息 (标题/价格/评分) ==================
+    details["标题"] = (driver.find_elements(By.CSS_SELECTOR, "h1.product-header__title") or [None])[0].get_attribute('textContent').strip() if driver.find_elements(By.CSS_SELECTOR, "h1.product-header__title") else "N/A"
+    
+    price_els = driver.find_elements(By.CSS_SELECTOR, ".product-price-info .price__numbers")
+    if price_els:
+        details["价格"] = price_els[0].get_attribute('textContent').strip()
+
+    # ================== 3. 模态框数据 (EAN/SKU/品牌)  ==================
+    def get_modal_data(button_selector, table_selector, is_description=False):
+        try:
+            btn = driver.find_elements(By.CSS_SELECTOR, button_selector)
+            if not btn: return False
+            
+            # 滚动并强制点击
+            driver.execute_script("arguments[0].scrollIntoView({block: 'center'});", btn[0])
+            time.sleep(1)
+            driver.execute_script("arguments[0].click();", btn[0])
+            
+            # 等待模态框内容加载（精准定位到 .modal__content 内部）
+            WebDriverWait(driver, 12).until(
+                lambda d: d.find_elements(By.CSS_SELECTOR, f".modal__content {table_selector}")
+            )
+            time.sleep(0.8) # 确保数据完全挂载
+            
+            if is_description:
+                desc_parts = []
+                # 提取描述框顶部的子标题 (h3.font-m)
+                sub_title = driver.find_elements(By.CSS_SELECTOR, ".modal__content h3.font-m")
+                if sub_title:
+                    desc_parts.append(sub_title[0].get_attribute('textContent').strip())
+                
+                # 提取描述框主体长文本 (.rich-text-wrapper)
+                desc_container = driver.find_elements(By.CSS_SELECTOR, ".modal__content .rich-text-wrapper")
+                if desc_container:
+                    desc_parts.append(desc_container[0].get_attribute('textContent').strip())
+                
+                if desc_parts:
+                    details["描述"] = "\n".join(desc_parts)
+            else:
+                # 提取规格表格数据
+                rows = driver.find_elements(By.CSS_SELECTOR, ".modal__content .table-specifications__row")
+                for row in rows:
+                    try:
+                        k = row.find_element(By.CSS_SELECTOR, ".table__subtitle").get_attribute('textContent').strip()
+                        v = row.find_element(By.CSS_SELECTOR, ".table-specifications__right-container").get_attribute('textContent').strip()
+                        if "EAN" in k: details["EAN"] = v
+                        elif "Referência" in k: details["SKU"] = v
+                        elif "Marca" in k: details["品牌"] = v
+                    except:
+                        continue
+            
+            # 完美适配源码的关闭逻辑
+            close_btn = driver.find_elements(By.CSS_SELECTOR, ".modal__header button")
+            if close_btn: 
+                driver.execute_script("arguments[0].click();", close_btn[0])
+                time.sleep(0.5) # 给关闭动画一点缓冲时间，防止影响后续操作
+            return True
+            
+        except Exception as e:
+            logging.warning(f"模态框抓取异常 ({'描述' if is_description else '规格'}): {e}")
+            # 异常兜底：如果报错了，尝试强行关闭模态框，不让它挡住后面的操作
+            try:
+                close_btn = driver.find_elements(By.CSS_SELECTOR, ".modal__header button")
+                if close_btn: driver.execute_script("arguments[0].click();", close_btn[0])
+            except: pass
+            return False
+
+    # 尝试抓取技术规格
+    if not get_modal_data(".technical-specifications button", ".table-specifications"):
+        logging.warning("技术规格模态框抓取重试...")
+        # 二次尝试（可能是由于第一次滚动没触发渲染）
+        get_modal_data(".technical-specifications button", ".table-specifications")
+
+    # 尝试抓取描述
+    get_modal_data(".about-product button", ".rich-text-wrapper", is_description=True)
+
+    # ================== 4. 图片抓取 (带代理回退) ==================
+    try:
+        img_els = driver.find_elements(By.CSS_SELECTOR, "img.product-gallery__slider-image")
+        urls = [img.get_attribute('src') for img in img_els if img.get_attribute('src')][:5]
+        for i, url in enumerate(urls):
+            path = download_image(url, proxy_str=proxy_str) # 使用你要求的代理回退下载
+            if path:
+                up_url = upload_to_image_host(path)
+                if up_url: details[f"图{i+1}"] = up_url
+                try: os.remove(path)
+                except: pass
+    except: pass
+
+    return details
 
 def scrape_other_sellers_on_product_page(driver: uc.Chrome) -> List[Dict]:
     """
@@ -957,7 +898,7 @@ def session_producer(session_queue: multiprocessing.Queue, url_queue: multiproce
                 PROXY_PASS = c.get_key('PROXY_PASS')
                 
                 session_id = ''.join(random.choices(string.ascii_letters, k=12))
-                full_username = f"{PROXY_USER_BASE}-country-PT-sid-{session_id}-stime-60"
+                full_username = f"{PROXY_USER_BASE}-sid-{session_id}-stime-60"
                 proxy_node = f"{PROXY_HOST}:{PROXY_PORT}:{full_username}:{PROXY_PASS}"
                 proxy_wire = f"http://{full_username}:{PROXY_PASS}@{PROXY_HOST}:{PROXY_PORT}"
 
@@ -1414,9 +1355,10 @@ class ScraperWorker:
                     return True
             
             elif ttype == 'product_page':
-                # from __main__ import scrape_product_details, scrape_other_sellers_on_product_page, parse_price
                 
-                details = scrape_product_details(self.driver, url)
+                current_proxy = getattr(self, 'proxy_wire', None) 
+                
+                details = scrape_product_details(self.driver, url, proxy_str=current_proxy)
                 if not details or details.get('_status') == 'page_load_failed':
                     # 简单重试逻辑可在此处加强
                     return False
