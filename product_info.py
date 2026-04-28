@@ -20,6 +20,8 @@ from datetime import datetime
 from concurrent.futures import ProcessPoolExecutor, wait, FIRST_COMPLETED
 from typing import List, Dict, Optional, Any
 from urllib.parse import urlsplit, urlunsplit, urljoin
+import urllib3
+urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 
 # Selenium
 import seleniumwire.undetected_chromedriver as uc
@@ -63,7 +65,6 @@ def get_exe_dir():
 c = configloader.config()
 CHROME_FOR_TESTING_PATH = resource_path("cft/chrome-win64/chrome.exe")
 DRIVER_FOR_TESTING_PATH = resource_path("cft/chromedriver-win64/chromedriver.exe")
-NODE_SCRIPT_PATH = resource_path("index.js")
 BASE_URL = "https://www.worten.pt"
 exe_folder = get_exe_dir()
 
@@ -482,7 +483,7 @@ def scrape_sellers_from_page(driver: uc.Chrome, product_url: str) -> List[Dict]:
         cards_count = len(initial_cards)
         
         if cards_count == 0:
-            logging.warning(f"🟡 在 {driver.current_url} 的卖家页面上未找到任何真实卖家卡片。")
+            logging.warning(f" 在 {driver.current_url} 的卖家页面上未找到任何真实卖家卡片。")
             return []
 
         logging.info(f"在页面上找到了 {cards_count} 个卖家卡片。")
@@ -602,12 +603,32 @@ def scrape_product_details(driver: uc.Chrome, product_url: str, proxy_str: str =
     except Exception as e:
         logging.warning(f"运费抓取异常: {e}")
 
-    # ================== 2. 基础信息 (标题/价格/评分) ==================
+    # ================== 2. 基础信息 (标题/价格/评分/类目/销售和发货方) ==================
     details["标题"] = (driver.find_elements(By.CSS_SELECTOR, "h1.product-header__title") or [None])[0].get_attribute('textContent').strip() if driver.find_elements(By.CSS_SELECTOR, "h1.product-header__title") else "N/A"
     
     price_els = driver.find_elements(By.CSS_SELECTOR, ".product-price-info .price__numbers")
     if price_els:
         details["价格"] = price_els[0].get_attribute('textContent').strip()
+
+    # --- 评分 ---
+    try:
+        rating_el = driver.find_element(By.CSS_SELECTOR, "span.rating__star-value.semibold span")
+        details["产品评分"] = rating_el.get_attribute('textContent').strip()
+    except:
+        pass  # 保持默认 "N/A"
+
+    # --- 类目 (面包屑导航) ---
+    try:
+        breadcrumb_els = driver.find_elements(By.CSS_SELECTOR, "span.breadcrumbs__item__name")
+        if breadcrumb_els:
+            details["类目"] = " / ".join([el.get_attribute('textContent').strip() for el in breadcrumb_els])
+    except:
+        pass  # 保持默认 "N/A"
+
+    try:
+            seller_elem = driver.find_element(By.CSS_SELECTOR, "a[class*='product-price-info__link'] span")
+            details["销售和发货方"] = seller_elem.text.strip()
+    except: details["销售和发货方"] = "Worten"
 
     # ================== 3. 模态框数据 (EAN/SKU/品牌)  ==================
     def get_modal_data(button_selector, table_selector, is_description=False):
@@ -620,7 +641,7 @@ def scrape_product_details(driver: uc.Chrome, product_url: str, proxy_str: str =
             time.sleep(1)
             driver.execute_script("arguments[0].click();", btn[0])
             
-            # 等待模态框内容加载（精准定位到 .modal__content 内部）
+            # 等待模态框内容加载
             WebDriverWait(driver, 12).until(
                 lambda d: d.find_elements(By.CSS_SELECTOR, f".modal__content {table_selector}")
             )
@@ -653,7 +674,7 @@ def scrape_product_details(driver: uc.Chrome, product_url: str, proxy_str: str =
                     except:
                         continue
             
-            # 完美适配源码的关闭逻辑
+            # 关闭
             close_btn = driver.find_elements(By.CSS_SELECTOR, ".modal__header button")
             if close_btn: 
                 driver.execute_script("arguments[0].click();", close_btn[0])
@@ -683,12 +704,17 @@ def scrape_product_details(driver: uc.Chrome, product_url: str, proxy_str: str =
         img_els = driver.find_elements(By.CSS_SELECTOR, "img.product-gallery__slider-image")
         urls = [img.get_attribute('src') for img in img_els if img.get_attribute('src')][:5]
         for i, url in enumerate(urls):
-            path = download_image(url, proxy_str=proxy_str) # 使用你要求的代理回退下载
+            path = download_image(url, proxy_str=proxy_str) # 代理回退下载
             if path:
                 up_url = upload_to_image_host(path)
-                if up_url: details[f"图{i+1}"] = up_url
+                if up_url:
+                    details[f"图{i+1}"] = up_url
+                else:
+                    details[f"图{i+1}"] = "图床上传失败"
                 try: os.remove(path)
                 except: pass
+            else:
+                details[f"图{i+1}"] = "图片下载失败"
     except: pass
 
     return details
@@ -874,7 +900,7 @@ def create_chrome_driver(session_data: Dict) -> Optional[uc.Chrome]:
 # --- 生产者与会话管理 ---
 
 def session_producer(session_queue: multiprocessing.Queue, url_queue: multiprocessing.Queue, 
-                     node_script_path: str, stop_flag, port: int, num_producers: int,log_queue: multiprocessing.Queue):
+                     stop_flag, port: int, num_producers: int,log_queue: multiprocessing.Queue):
     """
     会话生产者：持续生成 CF 可用的 Session 并放入 session_queue。
     """
@@ -1353,6 +1379,14 @@ class ScraperWorker:
                     with self.results_lock:
                         self.all_seller_info.extend(data)
                     return True
+                else:
+                    # 跟卖页无数据或抓取失败，记录空结果
+                    with self.results_lock:
+                        self.all_seller_info.append({
+                            '初始链接': url, '店铺名称': '抓取失败', '链接': '抓取失败',
+                            '店铺运费': '抓取失败', '送货时间': '抓取失败'
+                        })
+                    return True
             
             elif ttype == 'product_page':
                 
@@ -1360,11 +1394,22 @@ class ScraperWorker:
                 
                 details = scrape_product_details(self.driver, url, proxy_str=current_proxy)
                 if not details or details.get('_status') == 'page_load_failed':
-                    # 简单重试逻辑可在此处加强
+                    # 页面加载失败，记录失败链接
+                    failed_record = {
+                        '商品链接': url, '标题': '抓取失败'
+                    }
+                    with self.results_lock:
+                        self.all_product_data.append(failed_record)
                     return False
                 
                 if details.get('_status') == 'invalid':
-                    return True # 视为处理完成（无效链接）
+                    # 404失效链接，记录失效链接
+                    invalid_record = {
+                        '商品链接': url, '标题': '失效链接'
+                    }
+                    with self.results_lock:
+                        self.all_product_data.append(invalid_record)
+                    return True
                 
                 # 抓取其他卖家
                 others = scrape_other_sellers_on_product_page(self.driver)
@@ -1393,6 +1438,13 @@ class ScraperWorker:
 
         except Exception as e:
             logging.error(f"[Worker {self.worker_id}] 任务失败 {url}: {e}")
+            # 异常失败，记录失败链接
+            if ttype == 'product_page':
+                failed_record = {
+                    '商品链接': url, '标题': '抓取失败'
+                }
+                with self.results_lock:
+                    self.all_product_data.append(failed_record)
             return False
         return False
 
@@ -1573,7 +1625,7 @@ def main(progress_callback=None, stop_check_callback=None):
         for i in range(num_producers):
             p = multiprocessing.Process(
                 target=session_producer,
-                args=(session_queue, url_queue, NODE_SCRIPT_PATH, stop_flag, cf_port, num_producers, log_queue)
+                args=(session_queue, url_queue, stop_flag, cf_port, num_producers, log_queue)
             )
             p.start()
             producers.append(p)

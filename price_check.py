@@ -56,11 +56,10 @@ def get_exe_dir():
 c = configloader.config()
 CHROME_FOR_TESTING_PATH = resource_path("cft/chrome-win64/chrome.exe")
 DRIVER_FOR_TESTING_PATH = resource_path("cft/chromedriver-win64/chromedriver.exe")
-NODE_SCRIPT_PATH = resource_path("index.js")
 BASE_URL = "https://www.worten.pt"
 exe_folder = get_exe_dir()
 
-INPUT_FILE = os.environ.get('WORTEN_INPUT_FILE') or os.path.join(exe_folder, "price_check_links.xlsx")
+INPUT_FILE = os.environ.get('WORTEN_INPUT_FILE') or os.path.join(exe_folder, "input_links.xlsx")
 timestamp = datetime.now().strftime("%Y%m%d_%H%M")
 OUTPUT_FILE = os.environ.get('WORTEN_OUTPUT_FILE') or os.path.join(exe_folder, f"worten_price_data_{timestamp}.xlsx")
 
@@ -78,6 +77,7 @@ logging.getLogger('seleniumwire').setLevel(logging.WARNING)
 
 PAGE_NAVIGATION_TIMEOUT = 100
 ELEMENT_WAIT_TIMEOUT = 60
+SELLER_SCRAPED_PAGE_COUNT = int(c.get_key('SELLER_SCRAPED_PAGE_COUNT'))
 
 # --- 核心工具函数 ---
 
@@ -155,7 +155,12 @@ def read_urls_from_excel(filename: str) -> Optional[List[Dict[str, Any]]]:
         if 'url' not in df.columns:
             logging.error(f"错误: Excel文件 '{filename}' 中未找到名为 'url' 的列。")
             return None
-        return df[['url']].dropna(subset=['url']).to_dict('records')
+        if 'pages_to_scrape' not in df.columns:
+            logging.info("在Excel中未找到 'pages_to_scrape' 列，将为所有店铺链接使用默认分页逻辑。")
+            df['pages_to_scrape'] = None
+        else:
+            df['pages_to_scrape'] = df['pages_to_scrape'].apply(lambda x: str(x) if pd.notna(x) and str(x).strip() != 'nan' else None)
+        return df[['url', 'pages_to_scrape']].dropna(subset=['url']).to_dict('records')
     except Exception as e:
         logging.error(f"读取Excel文件 '{filename}' 时发生错误: {e}")
         return None
@@ -280,7 +285,7 @@ def create_chrome_driver(session_data: Dict) -> Optional[uc.Chrome]:
 
 # --- 会话生产 ---
 
-def session_producer(session_queue, url_queue, node_script_path, stop_flag, port, num_producers, log_queue):
+def session_producer(session_queue, stop_flag, port, num_producers, log_queue):
     setup_log_queue_handler(log_queue)
     shutdown_buffer = num_producers if num_producers > 1 else 2
     while not stop_flag.value:
@@ -309,21 +314,153 @@ def get_fresh_session(session_queue):
 
 # --- 任务发现 ---
 
-def discovery_process_with_progress(initial_urls, url_queue, session_queue, discovery_completed_event, log_queue, total_estimated, total_increment_queue):
+def discovery_process_with_progress(initial_urls, url_queue, session_queue, discovery_completed_event, log_queue, total_estimated, total_increment_queue, all_product_data, results_lock):
     setup_log_queue_handler(log_queue)
     logging.info("--- [发现进程] 启动 ---")
-    total_estimated.value = 0 
-    
-    count = 0
+    total_estimated.value = 0
+
+    expansion_tasks = []
+
+    # 1. 快速分类：商品页 vs 店铺页
     for item in initial_urls:
         url = item.get('url')
-        if url:
+        if not url:
+            continue
+        if 'seller_id' in url:
+            expansion_tasks.append({'url': url, 'type': 'shop_page', 'pages': item.get('pages_to_scrape')})
+        elif 'produtos/' in url:
             url_queue.put({'url': url, 'type': 'product_page'})
-            count += 1
             if total_increment_queue:
-                total_increment_queue.put(1) # 发送增量信号
-    
-    logging.info(f"[发现进程] 已分发 {count} 个初始任务。")
+                total_increment_queue.put(1)
+        else:
+            url_queue.put({'url': url, 'type': 'product_page'})
+            if total_increment_queue:
+                total_increment_queue.put(1)
+
+    logging.info(f"[发现进程] 待展开店铺任务数: {len(expansion_tasks)}")
+
+    # 2. 处理店铺展开任务（爬取商品链接 + 从列表页直接提取价格）
+    if expansion_tasks:
+        driver = None
+        current_session_count = 0
+        MAX_URLS_PER_DISCOVERY = 15
+
+        for i, task in enumerate(expansion_tasks):
+            def ensure_driver_ready():
+                nonlocal driver, current_session_count
+                if driver is None or current_session_count >= MAX_URLS_PER_DISCOVERY:
+                    if driver:
+                        try: driver.quit()
+                        except: pass
+                    driver = None
+                    for attempt in range(3):
+                        logging.info(f"[发现进程] 获取新会话 (尝试 {attempt+1})...")
+                        session_data = get_fresh_session(session_queue)
+                        if not session_data:
+                            time.sleep(5); continue
+                        driver = create_chrome_driver(session_data)
+                        if driver: break
+                    if not driver: return False
+                    current_session_count = 0
+                return True
+
+            try:
+                if not ensure_driver_ready():
+                    logging.error(f"[发现进程] Driver 初始化失败，跳过任务 {task['url']}")
+                    continue
+
+                url = task['url']
+                # 解析页码
+                pages_str = str(task['pages']) if task['pages'] else ""
+                if pages_str and pages_str.lower() != 'nan':
+                    try:
+                        pages = [int(p.strip()) for p in pages_str.replace('，', ',').split(',') if p.strip().isdigit()]
+                    except:
+                        pages = range(1, SELLER_SCRAPED_PAGE_COUNT + 1)
+                else:
+                    pages = range(1, SELLER_SCRAPED_PAGE_COUNT + 1)
+
+                # 构建店铺搜索URL
+                seller_id = url.split('seller_id=')[-1]
+                target_url = f"https://www.worten.pt/search?query=*&facetFilters=seller_id:{seller_id}"
+
+                logging.info(f"[发现进程] 正在展开 ({i+1}/{len(expansion_tasks)}): {target_url} (页数: {list(pages)})")
+
+                for page_num in pages:
+                    sep = '&' if '?' in target_url else '?'
+                    p_url = f"{target_url}{sep}page={page_num}"
+
+                    if not ensure_driver_ready(): break
+                    nav_ok = navigate_with_retries(driver, p_url, max_attempts=2)
+
+                    if not nav_ok:
+                        logging.warning(f"[发现进程] 页 {page_num} 导航失败，跳过该页。")
+                        continue
+
+                    current_session_count += 1
+
+                    # 处理 cookie 弹窗
+                    try:
+                        cookie_btn = WebDriverWait(driver, 5).until(EC.element_to_be_clickable(
+                            (By.CSS_SELECTOR, "button[class='button--md button--primary button--black button'] span")))
+                        driver.execute_script("arguments[0].click();", cookie_btn)
+                    except:
+                        pass
+
+                    # 提取商品链接和价格
+                    found_links = False
+                    try:
+                        WebDriverWait(driver, 15).until(EC.presence_of_element_located(
+                            (By.CSS_SELECTOR, ".listing-content__list li a")))
+                        links = driver.find_elements(By.CSS_SELECTOR, ".listing-content__list li a")
+
+                        count = 0
+                        for l in links:
+                            href = l.get_attribute('href')
+                            if href:
+                                full_url = urljoin(BASE_URL, href)
+                                # 提取该卡片的价格
+                                price_str = None
+                                try:
+                                    # 向上找到包含该链接的 li 卡片
+                                    card = l.find_element(By.XPATH, "./ancestor::li")
+                                    price_meta = card.find_element(By.CSS_SELECTOR, 'meta[itemprop="price"]')
+                                    price_str = price_meta.get_attribute('content')
+                                except:
+                                    pass
+
+                                formatted_price = "N/A"
+                                if price_str:
+                                    try:
+                                        price_val = float(price_str)
+                                        formatted_price = f"€{price_val:.2f}"
+                                    except:
+                                        formatted_price = "N/A"
+
+                                with results_lock:
+                                    all_product_data.append({'商品链接': full_url, '价格': formatted_price})
+                                count += 1
+
+                        if count > 0:
+                            found_links = True
+                            if total_increment_queue:
+                                total_increment_queue.put(count)
+                            logging.info(f"[发现进程] 页 {page_num}: 发现 {count} 个商品（含价格）")
+
+                    except TimeoutException:
+                        logging.warning(f"[发现进程] 页 {page_num} 没找到商品列表，判定为末页。")
+
+                    if not found_links:
+                        break
+
+            except Exception as e:
+                logging.error(f"[发现进程] 任务 {task['url']} 发生错误: {e}")
+
+        if driver:
+            try: driver.quit()
+            except: pass
+
+    logging.info(f"[发现进程] 已分发所有任务。")
     discovery_completed_event.set()
 
 # --- 业务逻辑 ---
@@ -381,7 +518,7 @@ def scrape_product_price_details(driver: uc.Chrome, product_url: str) -> Optiona
     except Exception as e:
         return {"_status": "page_load_failed", "_error": str(e)}
 
-# --- Worker (核心修改点：继承进度功能) ---
+# --- Worker  ---
 
 class ScraperWorker:
     def __init__(self, url_queue, all_product_data, results_lock, session_queue, discovery_completed_event, log_queue=None, increment_queue=None):
@@ -568,11 +705,11 @@ def main(progress_callback=None, stop_check_callback=None):
         updater_t.start()
 
         # 启动组件
-        producers = [multiprocessing.Process(target=session_producer, args=(session_queue, url_queue, NODE_SCRIPT_PATH, stop_flag, cf_port, num_producers, log_queue)) for _ in range(num_producers)]
+        producers = [multiprocessing.Process(target=session_producer, args=(session_queue, stop_flag, cf_port, num_producers, log_queue)) for _ in range(num_producers)]
         for p in producers: p.start()
         time.sleep(10)
 
-        discovery_p = multiprocessing.Process(target=discovery_process_with_progress, args=(initial_urls, url_queue, session_queue, discovery_completed_event, log_queue, total_estimated, total_increment_queue))
+        discovery_p = multiprocessing.Process(target=discovery_process_with_progress, args=(initial_urls, url_queue, session_queue, discovery_completed_event, log_queue, total_estimated, total_increment_queue, all_product_data, results_lock))
         discovery_p.start()
 
         with ProcessPoolExecutor(max_workers=MAX_WORKERS) as executor:

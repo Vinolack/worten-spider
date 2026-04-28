@@ -48,6 +48,13 @@
 
 ## 执行步骤
 
+**环境**
+bash
+```
+ python -m venv .venv 
+ .\.venv\Scripts\activate
+ pip install -r .\requirements.txt
+
 **程序打包**
 bash
 ```

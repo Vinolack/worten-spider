@@ -1,0 +1,11 @@
+SELLER_SCRAPED_PAGE_COUNT = 3
+IMAGE_HOST_UPLOAD_URL = ""
+IMAGE_TOKEN = ""
+PROXY_HOST = ""
+PROXY_PORT = 1337
+PROXY_USER_BASE = ""
+PROXY_PASS = ""
+MAX_WORKER = 3
+cf_bypass_port = 3000
+num_session_producers = 3
+cf_host = ""

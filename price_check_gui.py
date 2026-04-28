@@ -101,7 +101,7 @@ class WortenScraperGUI:
         file_frame.columnconfigure(1, weight=1)
         
         ttk.Label(file_frame, text="输入文件:").grid(row=0, column=0, sticky=tk.W, padx=(0, 5))
-        self.input_file_var = tk.StringVar(value="price_check_links.xlsx")
+        self.input_file_var = tk.StringVar(value="input_links.xlsx")
         self.input_entry = ttk.Entry(file_frame, textvariable=self.input_file_var, width=50)
         self.input_entry.grid(row=0, column=1, sticky=(tk.W, tk.E), padx=(0, 5))
         ttk.Button(file_frame, text="浏览", command=self.browse_input_file).grid(row=0, column=2)
