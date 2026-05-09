@@ -16,6 +16,11 @@ import multiprocessing
 import subprocess
 import queue
 import configloader
+import paths as path_utils
+import browser_runtime
+from state_store import StateStore, default_state_db
+from excel_schemas import SELLER_COLUMNS, SELLER_SHEET, seller_failure_row
+from excel_io import read_url_rows, write_single_sheet_excel
 from datetime import datetime
 from concurrent.futures import ProcessPoolExecutor, wait, FIRST_COMPLETED
 from typing import List, Dict, Optional, Any
@@ -41,19 +46,13 @@ os.environ['SSL_CERT_FILE'] = certifi.where()
 os.environ['REQUESTS_CA_BUNDLE'] = certifi.where()
 
 def resource_path(relative_path):
-    try:
-        base_path = sys._MEIPASS
-    except Exception:
-        base_path = os.path.abspath(".")
-    return os.path.join(base_path, relative_path)
+    return path_utils.resource_path(relative_path)
 
 def get_exe_dir():
-    if getattr(sys, 'frozen', False):
-        return os.path.dirname(sys.executable)
-    else:
-        return os.path.dirname(os.path.abspath(__file__))
+    return path_utils.get_exe_dir()
 
 c = configloader.config()
+LOG_LEVEL = configloader.get_log_level(c)
 CHROME_FOR_TESTING_PATH = resource_path("cft/chrome-win64/chrome.exe")
 DRIVER_FOR_TESTING_PATH = resource_path("cft/chromedriver-win64/chromedriver.exe")
 NODE_SCRIPT_PATH = resource_path("index.js")
@@ -61,9 +60,9 @@ BASE_URL = "https://www.worten.pt"
 exe_folder = get_exe_dir()
 
 # 支持环境变量传递文件路径
-INPUT_FILE = os.environ.get('WORTEN_INPUT_FILE') or os.path.join(exe_folder, "input_links.xlsx")
+INPUT_FILE = os.path.join(exe_folder, "input_links.xlsx")
 timestamp = datetime.now().strftime("%Y%m%d_%H%M")
-OUTPUT_FILE = os.environ.get('WORTEN_OUTPUT_FILE') or os.path.join(exe_folder, f"worten_seller_data_{timestamp}.xlsx")
+OUTPUT_FILE = os.path.join(exe_folder, f"worten_seller_data_{timestamp}.xlsx")
 
 MAX_RETRIES = 3
 URL_RETRY_LIMIT = 5
@@ -74,7 +73,7 @@ SESSION_LIFESPAN_SECONDS = 10 * 60
 MIN_SESSION_USABLE_TIME_SECONDS = 4 * 60
 
 CHROME_INIT_LOCK = multiprocessing.Lock()
-logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - [Process %(process)d] - %(message)s')
+logging.basicConfig(level=LOG_LEVEL, format='%(asctime)s - %(levelname)s - [Process %(process)d] - %(message)s')
 logging.getLogger('seleniumwire').setLevel(logging.WARNING)
 
 PAGE_NAVIGATION_TIMEOUT = 100
@@ -91,97 +90,37 @@ def setup_log_queue_handler(log_queue):
                 for h in root.handlers[:]:
                     root.removeHandler(h)
             root.addHandler(qh)
-            root.setLevel(logging.INFO)
+            root.setLevel(LOG_LEVEL)
         except Exception:
             pass
 
 import requests
 
 def get_cf_cookie_from_api(port: int, proxy_str: Optional[str] = None) -> Optional[Dict]:
-
-    api_host = c.get_key('cf_host') 
-    api_url = f"http://{api_host}:{port}/cf-clearance-scraper"
-    
-    payload = {
-        "url": "https://www.worten.pt/",
-        "mode": "waf-session"
-    }
-    
-    # 解析传入的 proxy_str (格式预期为 "ip:port:账号:密码")
-    if proxy_str and proxy_str != 'null':
-        parts = proxy_str.split(':')
-        if len(parts) == 4:
-            host, proxy_port, username, password = parts
-            payload["proxy"] = {
-                "host": host,
-                "port": int(proxy_port),
-                "username": username,
-                "password": password
-            }
-        else:
-            logging.error(f"代理格式错误，预期为 ip:port:user:pass, 实际收到: {proxy_str}")
-            return None
-
-    try:
-        response = requests.post(
-            api_url,
-            json=payload,
-            headers={'Content-Type': 'application/json'},
-            timeout=90
-        )
-        response.raise_for_status()
-        return response.json()
-        
-    except requests.exceptions.RequestException as e:
-        err_msg = str(e)
-        if hasattr(e, 'response') and e.response is not None:
-            err_msg = f"{e.response.status_code} - {e.response.text}"
-        logging.error(f"请求 CF API 失败 [端口 {port}]: {err_msg}")
-        return None
+    return browser_runtime.get_cf_cookie_from_api(c, port, proxy_str)
 
 def close_cookie_pup(driver: uc.Chrome):
-    try:
-        cookie_pup_selector = "button[class='button--md button--primary button--black button'] span"
-        cookie_close_bth = WebDriverWait(driver, 10).until(
-            EC.element_to_be_clickable((By.CSS_SELECTOR, cookie_pup_selector))
-        )
-        driver.execute_script("arguments[0].click();", cookie_close_bth)
-        return True
-    except:
-        return False
+    return browser_runtime.close_cookie_pup(driver)
 
 def read_urls_from_excel(filename: str) -> Optional[List[Dict[str, Any]]]:
     try:
-        df = pd.read_excel(filename, engine='openpyxl')
-        if 'url' not in df.columns:
+        rows = read_url_rows(filename, include_pages=False)
+        if rows is None:
             logging.error(f"错误: Excel文件 '{filename}' 中未找到名为 'url' 的列。")
-            return None
-        return df[['url']].dropna(subset=['url']).to_dict('records')
+        return rows
     except Exception as e:
         logging.error(f"读取Excel文件 '{filename}' 时发生错误: {e}")
         return None
 
 def save_data_to_multiple_sheets(seller_data: List[Dict], filename: str):
-    if not seller_data:
-        logging.warning("没有任何数据可保存。")
-        return
-    try:
-        with pd.ExcelWriter(filename, engine='openpyxl') as writer:
-            df_sellers = pd.DataFrame(seller_data)
-            # 定义需要的列顺序
-            seller_columns = ['初始链接', '店铺名称', '链接', '店铺运费', '送货时间']
-            
-            # 兼容性处理
-            if '链接' not in df_sellers.columns and '店铺链接' in df_sellers.columns:
-                df_sellers.rename(columns={'店铺链接': '链接'}, inplace=True)
-            
-            # 重新索引
-            df_sellers = df_sellers.reindex(columns=seller_columns)
-            
-            df_sellers.to_excel(writer, sheet_name='跟卖链接数据 (Sellers)', index=False)
-            logging.info(f"已将 {len(df_sellers)} 条卖家数据保存到 {filename}。")
-    except Exception as e:
-        logging.error(f"保存数据失败: {e}")
+    normalized_rows = []
+    for row in seller_data:
+        normalized = dict(row)
+        if '链接' not in normalized and '店铺链接' in normalized:
+            normalized['链接'] = normalized.get('店铺链接')
+        normalized_rows.append(normalized)
+    write_single_sheet_excel(normalized_rows, filename, SELLER_COLUMNS, SELLER_SHEET)
+    logging.info(f"已将 {len(normalized_rows)} 条卖家数据保存到 {filename}。")
 
 def parse_price(price_str: str) -> Optional[float]:
     if not isinstance(price_str, str): return None
@@ -193,106 +132,27 @@ def parse_price(price_str: str) -> Optional[float]:
 
 def wait_for_safe_cpu(threshold: float = 85.0, check_interval: int = 5):
     """监控 CPU 使用率"""
-    if psutil is None: return
-    try:
-        while True:
-            cpu_usage = psutil.cpu_percent(interval=1)
-            if cpu_usage < threshold: break
-            logging.warning(f"系统 CPU 负载过高 ({cpu_usage}%)，暂停创建 Driver {check_interval}秒...")
-            time.sleep(check_interval)
-    except: pass
+    browser_runtime.wait_for_safe_cpu(threshold, check_interval)
 
 def force_kill_driver(driver):
     """彻底清理 Driver 及其相关的 Chrome 进程"""
-    if not driver: return
-    try: driver.quit()
-    except: pass
-    pids_to_kill = []
-    try:
-        if hasattr(driver, 'service') and driver.service.process:
-            pids_to_kill.append(driver.service.process.pid)
-        if hasattr(driver, 'browser_pid') and driver.browser_pid:
-            pids_to_kill.append(driver.browser_pid)
-    except: pass
-    for pid in pids_to_kill:
-        try:
-            proc = psutil.Process(pid)
-            for child in proc.children(recursive=True): child.kill()
-            proc.kill()
-        except: pass
+    browser_runtime.force_kill_driver(driver)
 
 def navigate_with_retries(driver: uc.Chrome, url: str, max_attempts: int = 3, backoff_base: int = 2) -> bool:
-    for attempt in range(1, max_attempts + 1):
-        try:
-            driver.get(url)
-            return True
-        except WebDriverException as e:
-            error_msg = str(e)
-            if "ERR_TUNNEL_CONNECTION_FAILED" in error_msg or "ERR_PROXY_CONNECTION_FAILED" in error_msg:
-                logging.error(f"代理隧道建立失败 (IP已废): {error_msg}")
-                return False
-            logging.warning(f"WebDriver 错误 (尝试 {attempt}/{max_attempts}): {e}")
-        
-        if attempt < max_attempts:
-            time.sleep(backoff_base ** (attempt - 1))
-    return False
+    return browser_runtime.navigate_with_retries(driver, url, max_attempts, backoff_base)
 
 def create_chrome_driver(session_data: Dict) -> Optional[uc.Chrome]:
     """统一创建并初始化 Chrome Driver """
-    if not session_data: return None
-    wait_for_safe_cpu(threshold=80.0)
-    cookies = session_data.get('cookies', [])
-    user_agent = session_data.get('headers', {}).get("user-agent")
-    proxy_wire = session_data.get('proxy_for_selenium_wire')
-    driver = None
-    for attempt in range(MAX_RETRIES): 
-        try:
-            sw_opts = {'proxy': {'http': proxy_wire, 'https': proxy_wire, 'no_proxy': 'localhost,127.0.0.1'}, 'verify_ssl': False}
-            opts = uc.ChromeOptions()
-            opts.page_load_strategy = 'eager'
-            opts.add_argument('--headless=new')
-            opts.add_argument('--disable-features=UseEcoQoSForBackgroundProcess')
-            opts.add_argument('--ignore-certificate-errors')
-            opts.add_argument('--no-sandbox')
-            opts.add_argument('--disable-dev-shm-usage')
-            opts.add_argument('--no-zygote') # 减少进程孵化开销
-            opts.add_argument('--disable-gpu-sandbox')
-            opts.add_argument('--disable-gpu')
-            opts.add_argument('--disable-popup-blocking')
-            opts.add_argument('--disable-extensions')
-            opts.add_argument('--disable-background-networking')
-            opts.add_argument('--disable-sync')
-            opts.add_argument('--disable-translate')
-            opts.add_argument('--disable-default-apps')
-            opts.add_argument('--no-first-run')
-            opts.add_argument('--disable-software-rasterizer')
-            opts.add_argument('--renderer-process-limit=1') 
-            if user_agent: opts.add_argument(f'--user-agent={user_agent}')
-            
-            with CHROME_INIT_LOCK:
-                wait_for_safe_cpu(threshold=80.0, check_interval=random.randint(3,5))
-                driver = uc.Chrome(browser_executable_path=CHROME_FOR_TESTING_PATH, driver_executable_path=DRIVER_FOR_TESTING_PATH, options=opts, seleniumwire_options=sw_opts, version_main=142)
-            
-            driver.set_page_load_timeout(60) 
-            driver.get(BASE_URL)
-            time.sleep(random.uniform(2, 4))
-            driver.delete_all_cookies()
-            for ck in cookies:
-                if 'sameSite' in ck and ck['sameSite'] not in ['Strict', 'Lax', 'None']: del ck['sameSite']
-                try: driver.add_cookie(ck)
-                except: pass 
-            return driver
-
-        except Exception as e:
-            logging.warning(f"创建 Driver 尝试 {attempt+1}/{MAX_RETRIES} 失败: {e}")
-            if driver:
-                force_kill_driver(driver)
-                driver = None
-            time.sleep(2) 
-
-    logging.error("创建 Driver 彻底失败.")
-    if driver: force_kill_driver(driver)
-    return None
+    return browser_runtime.create_chrome_driver(
+        session_data,
+        CHROME_FOR_TESTING_PATH,
+        DRIVER_FOR_TESTING_PATH,
+        BASE_URL,
+        CHROME_INIT_LOCK,
+        max_retries=MAX_RETRIES,
+        connection_timeout=20,
+        sleep_after_base_get=True,
+    )
 
 # --- 会话生产 ---
 
@@ -302,15 +162,8 @@ def session_producer(session_queue, url_queue, node_script_path, stop_flag, port
     while not stop_flag.value:
         try:
             if session_queue.qsize() < int(MAX_WORKERS / 2 + shutdown_buffer):
-                session_id = ''.join(random.choices(string.ascii_letters, k=12))
-                full_user = f"{c.get_key('PROXY_USER_BASE')}-country-PT-sid-{session_id}-stime-60"
-                proxy_node = f"{c.get_key('PROXY_HOST')}:{c.get_key('PROXY_PORT')}:{full_user}:{c.get_key('PROXY_PASS')}"
-                proxy_wire = f"http://{full_user}:{c.get_key('PROXY_PASS')}@{c.get_key('PROXY_HOST')}:{c.get_key('PROXY_PORT')}"
-                
-                session_data = get_cf_cookie_from_api(port, proxy_node)
+                session_data = browser_runtime.create_session_data(c, port)
                 if session_data and "cookies" in session_data:
-                    session_data['proxy_for_selenium_wire'] = proxy_wire
-                    session_data['created_at'] = time.time()
                     session_queue.put(session_data)
                     logging.info(f"[生产者{port}] 会话就绪。库存: {session_queue.qsize()}")
                 time.sleep(2)
@@ -318,27 +171,26 @@ def session_producer(session_queue, url_queue, node_script_path, stop_flag, port
         except: time.sleep(10)
 
 def get_fresh_session(session_queue):
-    while True:
-        try:
-            sd = session_queue.get(timeout=60)
-            if (time.time() - sd.get('created_at', 0)) < (SESSION_LIFESPAN_SECONDS - MIN_SESSION_USABLE_TIME_SECONDS): return sd
-        except queue.Empty: return None
+    return browser_runtime.get_fresh_session(session_queue, SESSION_LIFESPAN_SECONDS, MIN_SESSION_USABLE_TIME_SECONDS)
 
 # --- 任务发现 (带进度增量) ---
 
-def discovery_process_with_progress(initial_urls, url_queue, session_queue, discovery_completed_event, log_queue, total_estimated, total_increment_queue):
+def discovery_process_with_progress(initial_urls, url_queue, session_queue, discovery_completed_event, log_queue, total_estimated, total_increment_queue, state_db_path=None, run_id=None):
     setup_log_queue_handler(log_queue)
     logging.info("--- [发现进程] 启动 ---")
     total_estimated.value = 0 
+    state = StateStore(state_db_path) if state_db_path and run_id else None
     
     count = 0
     for item in initial_urls:
         url = item.get('url')
         if url:
-            url_queue.put({'url': url, 'type': 'product_page'})
-            count += 1
-            if total_increment_queue:
-                total_increment_queue.put(1) # 发送增量信号
+            task = {'url': url, 'type': 'product_page'}
+            if not state or state.add_task(run_id, task, 'more_seller', max_attempts=URL_RETRY_LIMIT + 1):
+                url_queue.put(task)
+                count += 1
+                if total_increment_queue:
+                    total_increment_queue.put(1) # 发送增量信号
     
     logging.info(f"[发现进程] 已分发 {count} 个初始任务。")
     discovery_completed_event.set()
@@ -355,7 +207,7 @@ def scrape_other_sellers_logic(driver: uc.Chrome, product_url: str) -> List[Dict
     # 1. 导航 
     if not navigate_with_retries(driver, product_url, max_attempts=3):
         logging.error(f"页面导航彻底失败: {product_url}")
-        return []
+        return [{"ERROR": "page_load_failed"}]
 
     # 404 检测
     try:
@@ -469,7 +321,7 @@ def scrape_other_sellers_logic(driver: uc.Chrome, product_url: str) -> List[Dict
 # --- Worker ---
 
 class ScraperWorker:
-    def __init__(self, url_queue, more_seller_info_data, results_lock, session_queue, discovery_completed_event, log_queue=None, increment_queue=None):
+    def __init__(self, url_queue, more_seller_info_data, results_lock, session_queue, discovery_completed_event, log_queue=None, increment_queue=None, state_db_path=None, run_id=None):
         self.url_queue = url_queue
         self.more_seller_info_data = more_seller_info_data
         self.results_lock = results_lock
@@ -477,6 +329,9 @@ class ScraperWorker:
         self.discovery_completed_event = discovery_completed_event
         self.log_queue = log_queue
         self.increment_queue = increment_queue
+        self.state_db_path = state_db_path
+        self.run_id = run_id
+        self.state = StateStore(state_db_path) if state_db_path and run_id else None
         self.worker_id = str(uuid.uuid4())[:8]
         self.driver = None
         self.processed_count = 0
@@ -543,6 +398,9 @@ class ScraperWorker:
 
     def process_task(self, task):
         url = task['url']
+        task_key = task.get('task_key')
+        if self.state and not self.state.claim_task(self.run_id, task, self.worker_id):
+            return True
         try:
             # 执行抓取逻辑
             other_sellers_info = scrape_other_sellers_logic(self.driver, url)
@@ -550,32 +408,55 @@ class ScraperWorker:
             # 检查是否有特定错误标记
             if other_sellers_info and "ERROR" in other_sellers_info[0]:
                 if other_sellers_info[0]["ERROR"] == "404":
+                    row = seller_failure_row(url, '失效链接 (404)')
                     with self.results_lock:
-                        self.more_seller_info_data.append({'初始链接': url, '店铺名称': '失效链接 (404)'})
+                        self.more_seller_info_data.append(row)
+                    if self.state and task_key:
+                        self.state.complete_task(self.run_id, task_key, 'seller', [row], status='invalid', error='404')
                     return True # 视为成功处理（虽然是无效链接）
+                if other_sellers_info[0]["ERROR"] == "page_load_failed":
+                    row = seller_failure_row(url, '抓取失败')
+                    with self.results_lock:
+                        self.more_seller_info_data.append(row)
+                    if self.state and task_key:
+                        self.state.fail_task(self.run_id, task_key, 'seller', [row], 'page_load_failed')
+                    return False
+                row = seller_failure_row(url, '抓取失败')
+                with self.results_lock:
+                    self.more_seller_info_data.append(row)
+                if self.state and task_key:
+                    self.state.fail_task(self.run_id, task_key, 'seller', [row], str(other_sellers_info[0].get('ERROR')))
                 return False # 其他错误视为失败
 
+            task_rows = []
             if not other_sellers_info:
                 # 空列表，可能是页面没有其他卖家，也可能是加载失败。
-                with self.results_lock:
-                    self.more_seller_info_data.append({'初始链接': url, '店铺名称': '无更多卖家'})
+                task_rows.append(seller_failure_row(url, '无更多卖家'))
             else:
                 for seller in other_sellers_info:
-                    seller_record = {
+                    task_rows.append({
                         '初始链接': url,
                         '店铺名称': seller.get('店铺名称', 'N/A'),
                         '链接': seller.get('链接', 'N/A'),
                         '店铺运费': seller.get('店铺运费', 'N/A'),
                         '送货时间': seller.get('送货时间', 'N/A')
-                    }
-                    with self.results_lock:
-                        self.more_seller_info_data.append(seller_record)
+                    })
+            with self.results_lock:
+                for seller_record in task_rows:
+                    self.more_seller_info_data.append(seller_record)
+            if self.state and task_key:
+                self.state.complete_task(self.run_id, task_key, 'seller', task_rows)
                 
             logging.info(f" 成功处理: {url}，抓取到 {len(other_sellers_info)} 个卖家。")
             return True
 
         except Exception as e:
             logging.error(f"[Worker {self.worker_id}] 任务异常 {url}: {e}")
+            row = seller_failure_row(url, '抓取失败')
+            with self.results_lock:
+                self.more_seller_info_data.append(row)
+            if self.state and task_key:
+                self.state.fail_task(self.run_id, task_key, 'seller', [row], str(e))
             return False
 
 # --- 进度管理进程 ---
@@ -594,17 +475,25 @@ def progress_manager(processed_count, total_estimated, increment_queue, total_in
 
 # --- 主函数 ---
 
-def main(progress_callback=None, stop_check_callback=None):
+def main(progress_callback=None, stop_check_callback=None, input_file=None, output_file=None, state_db_path=None):
     multiprocessing.freeze_support()
     os.environ["WDM_DEFAULT_TIMEOUT"] = "90"
     cf_port = int(c.get_key('cf_bypass_port') or 3000)
     num_producers = int(c.get_key('num_session_producers') or 1)
+    input_file = input_file or INPUT_FILE
+    output_file = output_file or OUTPUT_FILE
+    state_db_path = state_db_path or default_state_db()
+    state = StateStore(state_db_path)
     
     logging.info(f"--- Worten 更多卖家爬虫启动 (Workers: {MAX_WORKERS}) ---")
-    initial_urls = read_urls_from_excel(INPUT_FILE)
+    initial_urls = read_urls_from_excel(input_file)
     if not initial_urls:
         logging.error("未找到输入链接。")
-        return
+        return {'status': 'failed', 'message': '未找到输入链接'}
+    run_id, resumed = state.create_or_resume_run('more_seller', input_file, output_file)
+    if resumed:
+        logging.info(f"继续未完成任务: run_id={run_id}, output_file={output_file}")
+    state.recover_stale_tasks(run_id)
 
     def _log_listener(q):
         root = logging.getLogger()
@@ -645,11 +534,12 @@ def main(progress_callback=None, stop_check_callback=None):
                 if progress_callback:
                     elapsed = time.time() - start_time.value
                     rate = processed_count.value / (elapsed / 60) if elapsed > 0 else 0
+                    progress = state.progress(run_id)
                     progress_callback({
-                        'processed': processed_count.value,
-                        'total': total_estimated.value,
+                        'processed': progress['processed'],
+                        'total': progress['total'] or total_estimated.value,
                         'rate': rate,
-                        'message': f'正在分析卖家信息: {processed_count.value}/{total_estimated.value}'
+                        'message': f"正在分析卖家信息: {progress['processed']}/{progress['total'] or total_estimated.value}"
                     })
                 if stop_check_callback and stop_check_callback():
                     stop_flag.value = True
@@ -659,18 +549,22 @@ def main(progress_callback=None, stop_check_callback=None):
         updater_t.start()
 
         # 启动组件
+        for task in state.load_unfinished_tasks(run_id):
+            url_queue.put(task)
         producers = [multiprocessing.Process(target=session_producer, args=(session_queue, url_queue, NODE_SCRIPT_PATH, stop_flag, cf_port, num_producers, log_queue)) for _ in range(num_producers)]
         for p in producers: p.start()
         time.sleep(10)
 
         # 启动发现进程 (带进度)
-        discovery_p = multiprocessing.Process(target=discovery_process_with_progress, args=(initial_urls, url_queue, session_queue, discovery_completed_event, log_queue, total_estimated, total_increment_queue))
+        discovery_p = multiprocessing.Process(target=discovery_process_with_progress, args=(initial_urls, url_queue, session_queue, discovery_completed_event, log_queue, total_estimated, total_increment_queue, state_db_path, run_id))
         discovery_p.start()
 
         # 启动 Workers
         with ProcessPoolExecutor(max_workers=MAX_WORKERS) as executor:
-            futures = [executor.submit(ScraperWorker(url_queue, more_seller_info_data, results_lock, session_queue, discovery_completed_event, log_queue, increment_queue).run) for _ in range(MAX_WORKERS)]
+            futures = [executor.submit(ScraperWorker(url_queue, more_seller_info_data, results_lock, session_queue, discovery_completed_event, log_queue, increment_queue, state_db_path, run_id).run) for _ in range(MAX_WORKERS)]
             wait(futures)
+            for future in futures:
+                future.result()
 
         # 收尾
         stop_flag.value = True
@@ -679,12 +573,20 @@ def main(progress_callback=None, stop_check_callback=None):
         for p in producers: p.join(timeout=5)
         pm_p.join(timeout=5)
         
-        save_data_to_multiple_sheets(list(more_seller_info_data), OUTPUT_FILE)
+        rows_by_group = state.grouped_result_rows(run_id)
+        save_data_to_multiple_sheets(rows_by_group.get('seller', list(more_seller_info_data)), output_file)
+        if state.has_incomplete_tasks(run_id):
+            message = '仍有未完成任务，稍后可再次点击开始/继续任务'
+            state.set_run_status(run_id, 'failed', message)
+            raise RuntimeError(message)
+        state.set_run_status(run_id, 'completed')
         
         if progress_callback: 
             elapsed_time = time.time() - start_time.value
             final_rate = processed_count.value / (elapsed_time / 60) if elapsed_time > 0 else 0
-            progress_callback({'processed': processed_count.value, 'total': total_estimated.value, 'rate': final_rate, 'message': '任务完成！'})
+            progress = state.progress(run_id)
+            progress_callback({'processed': progress['processed'], 'total': progress['total'], 'rate': final_rate, 'message': '任务完成！'})
+        return {'status': 'completed', 'run_id': run_id, 'resumed': resumed, 'output_file': output_file}
 
     if os.name == 'nt':
         try: subprocess.run("taskkill /F /T /IM chrome*", shell=True, stderr=subprocess.DEVNULL)

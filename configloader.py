@@ -1,6 +1,29 @@
 import sys
 import os
+import logging
 import toml  
+
+LOG_LEVELS = {
+    "DEBUG": logging.DEBUG,
+    "INFO": logging.INFO,
+    "WARNING": logging.WARNING,
+    "ERROR": logging.ERROR,
+    "CRITICAL": logging.CRITICAL,
+}
+
+
+def parse_log_level(value, default=logging.INFO):
+    if not isinstance(value, str):
+        return default
+    return LOG_LEVELS.get(value.strip().upper(), default)
+
+
+def get_log_level(cfg, key="LOG_LEVEL", default=logging.INFO):
+    try:
+        return parse_log_level(cfg.get_key(key), default=default)
+    except Exception:
+        return default
+
 
 class config:
     def __init__(self):

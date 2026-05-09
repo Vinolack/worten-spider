@@ -6,6 +6,7 @@ PROXY_PORT = 1337
 PROXY_USER_BASE = ""
 PROXY_PASS = ""
 MAX_WORKER = 3
+LOG_LEVEL = "INFO"
 cf_bypass_port = 3000
 num_session_producers = 3
 cf_host = ""

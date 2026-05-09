@@ -6,3 +6,5 @@ product_image/.
 build/
 dist/
 cft/
+.vscode/
+worten_runs.sqlite
