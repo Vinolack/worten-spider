@@ -14,7 +14,6 @@ import psutil
 import pandas as pd
 import multiprocessing
 import subprocess
-import queue
 import configloader
 import paths as path_utils
 import browser_runtime
@@ -55,7 +54,6 @@ c = configloader.config()
 LOG_LEVEL = configloader.get_log_level(c)
 CHROME_FOR_TESTING_PATH = resource_path("cft/chrome-win64/chrome.exe")
 DRIVER_FOR_TESTING_PATH = resource_path("cft/chromedriver-win64/chromedriver.exe")
-NODE_SCRIPT_PATH = resource_path("index.js")
 BASE_URL = "https://www.worten.pt"
 exe_folder = get_exe_dir()
 
@@ -156,7 +154,7 @@ def create_chrome_driver(session_data: Dict) -> Optional[uc.Chrome]:
 
 # --- 会话生产 ---
 
-def session_producer(session_queue, url_queue, node_script_path, stop_flag, port, num_producers, log_queue):
+def session_producer(session_queue, stop_flag, port, num_producers, log_queue):
     setup_log_queue_handler(log_queue)
     shutdown_buffer = num_producers if num_producers > 1 else 2
     while not stop_flag.value:
@@ -175,25 +173,33 @@ def get_fresh_session(session_queue):
 
 # --- 任务发现 (带进度增量) ---
 
-def discovery_process_with_progress(initial_urls, url_queue, session_queue, discovery_completed_event, log_queue, total_estimated, total_increment_queue, state_db_path=None, run_id=None):
+def discovery_process_with_progress(initial_urls, session_queue, discovery_completed_event, log_queue, total_estimated, total_increment_queue, state_db_path=None, run_id=None):
     setup_log_queue_handler(log_queue)
     logging.info("--- [发现进程] 启动 ---")
     total_estimated.value = 0 
     state = StateStore(state_db_path) if state_db_path and run_id else None
-    
     count = 0
-    for item in initial_urls:
-        url = item.get('url')
-        if url:
-            task = {'url': url, 'type': 'product_page'}
-            if not state or state.add_task(run_id, task, 'more_seller', max_attempts=URL_RETRY_LIMIT + 1):
-                url_queue.put(task)
-                count += 1
-                if total_increment_queue:
-                    total_increment_queue.put(1) # 发送增量信号
-    
-    logging.info(f"[发现进程] 已分发 {count} 个初始任务。")
-    discovery_completed_event.set()
+    try:
+        if state:
+            state.mark_discovery_started(run_id)
+        for item in initial_urls:
+            url = item.get('url')
+            if url:
+                task = {'url': url, 'type': 'product_page'}
+                if not state or state.add_task(run_id, task, 'more_seller', max_attempts=URL_RETRY_LIMIT + 1):
+                    count += 1
+                    if total_increment_queue:
+                        total_increment_queue.put(1) # 发送增量信号
+        if state:
+            state.mark_discovery_finished(run_id)
+        logging.info(f"[发现进程] 已写入 {count} 个初始任务。")
+    except Exception as e:
+        logging.error(f"[发现进程] 任务发现失败: {e}")
+        if state:
+            state.mark_discovery_failed(run_id, str(e))
+        raise
+    finally:
+        discovery_completed_event.set()
 
 # --- 业务逻辑  ---
 
@@ -321,8 +327,7 @@ def scrape_other_sellers_logic(driver: uc.Chrome, product_url: str) -> List[Dict
 # --- Worker ---
 
 class ScraperWorker:
-    def __init__(self, url_queue, more_seller_info_data, results_lock, session_queue, discovery_completed_event, log_queue=None, increment_queue=None, state_db_path=None, run_id=None):
-        self.url_queue = url_queue
+    def __init__(self, more_seller_info_data, results_lock, session_queue, discovery_completed_event, log_queue=None, increment_queue=None, state_db_path=None, run_id=None, stop_flag=None):
         self.more_seller_info_data = more_seller_info_data
         self.results_lock = results_lock
         self.session_queue = session_queue
@@ -331,6 +336,7 @@ class ScraperWorker:
         self.increment_queue = increment_queue
         self.state_db_path = state_db_path
         self.run_id = run_id
+        self.stop_flag = stop_flag
         self.state = StateStore(state_db_path) if state_db_path and run_id else None
         self.worker_id = str(uuid.uuid4())[:8]
         self.driver = None
@@ -363,44 +369,109 @@ class ScraperWorker:
 
     def run(self):
         setup_log_queue_handler(self.log_queue)
-        while True:
-            try:
-                task = self.url_queue.get(block=True, timeout=2)
-            except queue.Empty:
-                if self.discovery_completed_event.is_set(): break
-                else: continue
+        if not self.state:
+            logging.error(f"[Worker {self.worker_id}] 状态存储不可用，Worker 退出。")
+            return
 
-            if self.driver is None:
-                if not self.setup_driver():
-                    self.url_queue.put(task)
+        task_key = None
+        try:
+            while True:
+                if self.stop_flag is not None and self.stop_flag.value:
                     break
 
-            if self.processed_count >= self.current_max_urls:
-                logging.info(f"[Worker {self.worker_id}] 轮换 Driver...")
-                self.teardown_driver()
-                if not self.setup_driver():
-                    self.url_queue.put(task)
+                task = self.state.claim_next_task(self.run_id, self.worker_id)
+                if not task:
+                    if self.state.is_discovery_finished(self.run_id):
+                        break
+                    time.sleep(2)
+                    continue
+
+                task_key = task.get('task_key')
+                if self.stop_flag is not None and self.stop_flag.value:
+                    if task_key:
+                        self.state.release_task(self.run_id, task_key, self.worker_id, consume_attempt=False, error='任务已停止')
+                    task_key = None
                     break
 
-            # 处理任务并发送进度信号
-            success = self.process_task(task)
-            if self.increment_queue:
-                self.increment_queue.put(1) # 进度+1
+                if self.driver is None:
+                    if not self.setup_driver():
+                        if task_key:
+                            self.state.release_task(self.run_id, task_key, self.worker_id, consume_attempt=False, error='driver_setup_failed')
+                        task_key = None
+                        break
 
-            if success: self.consecutive_failures = 0
-            else: self.consecutive_failures += 1
-            self.processed_count += 1
+                if self.processed_count >= self.current_max_urls:
+                    logging.info(f"[Worker {self.worker_id}] 轮换 Driver...")
+                    self.teardown_driver()
+                    if not self.setup_driver():
+                        if task_key:
+                            self.state.release_task(self.run_id, task_key, self.worker_id, consume_attempt=False, error='driver_rotation_failed')
+                        task_key = None
+                        break
 
-            if self.consecutive_failures >= 3:
-                self.teardown_driver()
-                self.consecutive_failures = 0
-        self.teardown_driver()
+                # 处理任务并发送进度信号
+                success = self.process_task(task)
+                task_key = None
+                if self.increment_queue:
+                    self.increment_queue.put(1) # 进度+1
+
+                if success: self.consecutive_failures = 0
+                else: self.consecutive_failures += 1
+                self.processed_count += 1
+
+                if self.consecutive_failures >= 3:
+                    self.teardown_driver()
+                    self.consecutive_failures = 0
+        except Exception as exc:
+            logging.error(f"[Worker {self.worker_id}] Worker 异常退出: {exc}")
+            if task_key:
+                self.state.release_task(self.run_id, task_key, self.worker_id, consume_attempt=False, error=str(exc))
+            raise
+        finally:
+            self.teardown_driver()
+
+    def record_task_result(self, task_key, result_group, rows, status='succeeded', error=None):
+        result_rows = list(rows)
+        if self.state and task_key:
+            saved = self.state.complete_task(
+                self.run_id,
+                task_key,
+                result_group,
+                result_rows,
+                status=status,
+                error=error,
+                owner=self.worker_id,
+            )
+            if not saved:
+                logging.warning(f"[Worker {self.worker_id}] 任务 lease 已失效，丢弃本地结果: {task_key}")
+                return False
+        with self.results_lock:
+            for row in result_rows:
+                self.more_seller_info_data.append(row)
+        return True
+
+    def record_task_failure(self, task_key, result_group, rows, error):
+        result_rows = list(rows)
+        if self.state and task_key:
+            saved = self.state.fail_task(
+                self.run_id,
+                task_key,
+                result_group,
+                result_rows,
+                error,
+                owner=self.worker_id,
+            )
+            if not saved:
+                logging.warning(f"[Worker {self.worker_id}] 任务 lease 已失效，丢弃失败结果: {task_key}")
+                return False
+        with self.results_lock:
+            for row in result_rows:
+                self.more_seller_info_data.append(row)
+        return True
 
     def process_task(self, task):
         url = task['url']
         task_key = task.get('task_key')
-        if self.state and not self.state.claim_task(self.run_id, task, self.worker_id):
-            return True
         try:
             # 执行抓取逻辑
             other_sellers_info = scrape_other_sellers_logic(self.driver, url)
@@ -409,23 +480,13 @@ class ScraperWorker:
             if other_sellers_info and "ERROR" in other_sellers_info[0]:
                 if other_sellers_info[0]["ERROR"] == "404":
                     row = seller_failure_row(url, '失效链接 (404)')
-                    with self.results_lock:
-                        self.more_seller_info_data.append(row)
-                    if self.state and task_key:
-                        self.state.complete_task(self.run_id, task_key, 'seller', [row], status='invalid', error='404')
-                    return True # 视为成功处理（虽然是无效链接）
+                    return self.record_task_result(task_key, 'seller', [row], status='invalid', error='404')
                 if other_sellers_info[0]["ERROR"] == "page_load_failed":
                     row = seller_failure_row(url, '抓取失败')
-                    with self.results_lock:
-                        self.more_seller_info_data.append(row)
-                    if self.state and task_key:
-                        self.state.fail_task(self.run_id, task_key, 'seller', [row], 'page_load_failed')
+                    self.record_task_failure(task_key, 'seller', [row], 'page_load_failed')
                     return False
                 row = seller_failure_row(url, '抓取失败')
-                with self.results_lock:
-                    self.more_seller_info_data.append(row)
-                if self.state and task_key:
-                    self.state.fail_task(self.run_id, task_key, 'seller', [row], str(other_sellers_info[0].get('ERROR')))
+                self.record_task_failure(task_key, 'seller', [row], str(other_sellers_info[0].get('ERROR')))
                 return False # 其他错误视为失败
 
             task_rows = []
@@ -441,22 +502,15 @@ class ScraperWorker:
                         '店铺运费': seller.get('店铺运费', 'N/A'),
                         '送货时间': seller.get('送货时间', 'N/A')
                     })
-            with self.results_lock:
-                for seller_record in task_rows:
-                    self.more_seller_info_data.append(seller_record)
-            if self.state and task_key:
-                self.state.complete_task(self.run_id, task_key, 'seller', task_rows)
-                
-            logging.info(f" 成功处理: {url}，抓取到 {len(other_sellers_info)} 个卖家。")
-            return True
+            saved = self.record_task_result(task_key, 'seller', task_rows)
+            if saved:
+                logging.info(f" 成功处理: {url}，抓取到 {len(other_sellers_info)} 个卖家。")
+            return saved
 
         except Exception as e:
             logging.error(f"[Worker {self.worker_id}] 任务异常 {url}: {e}")
             row = seller_failure_row(url, '抓取失败')
-            with self.results_lock:
-                self.more_seller_info_data.append(row)
-            if self.state and task_key:
-                self.state.fail_task(self.run_id, task_key, 'seller', [row], str(e))
+            self.record_task_failure(task_key, 'seller', [row], str(e))
             return False
 
 # --- 进度管理进程 ---
@@ -493,7 +547,11 @@ def main(progress_callback=None, stop_check_callback=None, input_file=None, outp
     run_id, resumed = state.create_or_resume_run('more_seller', input_file, output_file)
     if resumed:
         logging.info(f"继续未完成任务: run_id={run_id}, output_file={output_file}")
-    state.recover_stale_tasks(run_id)
+        recovered = state.recover_running_tasks(run_id, '程序重新启动，任务重新排队')
+        if recovered:
+            logging.info(f"已恢复 {recovered} 个上次运行遗留的进行中任务。")
+    else:
+        state.recover_stale_tasks(run_id)
 
     def _log_listener(q):
         root = logging.getLogger()
@@ -509,7 +567,6 @@ def main(progress_callback=None, stop_check_callback=None, input_file=None, outp
         listener_thread = threading.Thread(target=_log_listener, args=(log_queue,), daemon=True)
         listener_thread.start()
 
-        url_queue = manager.Queue()
         session_queue = manager.Queue()
         stop_flag = manager.Value('b', False)
         discovery_completed_event = manager.Event()
@@ -530,6 +587,7 @@ def main(progress_callback=None, stop_check_callback=None, input_file=None, outp
 
         # 进度回调线程
         def progress_updater():
+            last_queue_log = 0
             while not stop_flag.value:
                 if progress_callback:
                     elapsed = time.time() - start_time.value
@@ -541,6 +599,19 @@ def main(progress_callback=None, stop_check_callback=None, input_file=None, outp
                         'rate': rate,
                         'message': f"正在分析卖家信息: {progress['processed']}/{progress['total'] or total_estimated.value}"
                     })
+
+                now = time.time()
+                if now - last_queue_log >= 10:
+                    stats = state.queue_stats(run_id)
+                    discovery = state.discovery_status(run_id)
+                    logging.info(
+                        f"[队列状态] discovery={discovery}, total={stats['total']}, "
+                        f"pending={stats['pending']}, running={stats['running']}, "
+                        f"active_workers={stats['active_workers']}/{MAX_WORKERS}, succeeded={stats['succeeded']}, "
+                        f"failed_final={stats['failed_final']}, invalid={stats['invalid']}"
+                    )
+                    last_queue_log = now
+
                 if stop_check_callback and stop_check_callback():
                     stop_flag.value = True
                 time.sleep(2)
@@ -549,30 +620,46 @@ def main(progress_callback=None, stop_check_callback=None, input_file=None, outp
         updater_t.start()
 
         # 启动组件
-        for task in state.load_unfinished_tasks(run_id):
-            url_queue.put(task)
-        producers = [multiprocessing.Process(target=session_producer, args=(session_queue, url_queue, NODE_SCRIPT_PATH, stop_flag, cf_port, num_producers, log_queue)) for _ in range(num_producers)]
-        for p in producers: p.start()
-        time.sleep(10)
+        producers = []
+        discovery_p = None
+        try:
+            producers = [multiprocessing.Process(target=session_producer, args=(session_queue, stop_flag, cf_port, num_producers, log_queue)) for _ in range(num_producers)]
+            for p in producers: p.start()
+            time.sleep(10)
 
-        # 启动发现进程 (带进度)
-        discovery_p = multiprocessing.Process(target=discovery_process_with_progress, args=(initial_urls, url_queue, session_queue, discovery_completed_event, log_queue, total_estimated, total_increment_queue, state_db_path, run_id))
-        discovery_p.start()
+            # 启动发现进程 (带进度)
+            discovery_p = multiprocessing.Process(target=discovery_process_with_progress, args=(initial_urls, session_queue, discovery_completed_event, log_queue, total_estimated, total_increment_queue, state_db_path, run_id))
+            discovery_p.start()
 
-        # 启动 Workers
-        with ProcessPoolExecutor(max_workers=MAX_WORKERS) as executor:
-            futures = [executor.submit(ScraperWorker(url_queue, more_seller_info_data, results_lock, session_queue, discovery_completed_event, log_queue, increment_queue, state_db_path, run_id).run) for _ in range(MAX_WORKERS)]
-            wait(futures)
-            for future in futures:
-                future.result()
-
-        # 收尾
-        stop_flag.value = True
-        log_queue.put(None)
-        discovery_p.join(timeout=5)
-        for p in producers: p.join(timeout=5)
-        pm_p.join(timeout=5)
+            # 启动 Workers
+            with ProcessPoolExecutor(max_workers=MAX_WORKERS) as executor:
+                futures = [executor.submit(ScraperWorker(more_seller_info_data, results_lock, session_queue, discovery_completed_event, log_queue, increment_queue, state_db_path, run_id, stop_flag).run) for _ in range(MAX_WORKERS)]
+                wait(futures)
+                for future in futures:
+                    future.result()
+        finally:
+            stop_flag.value = True
+            try:
+                log_queue.put(None)
+            except Exception:
+                pass
+            if discovery_p is not None:
+                discovery_p.join(timeout=5)
+                if discovery_p.is_alive():
+                    discovery_p.terminate()
+            for p in producers:
+                p.join(timeout=5)
+                if p.is_alive():
+                    p.terminate()
+            pm_p.join(timeout=5)
+            if pm_p.is_alive():
+                pm_p.terminate()
         
+        discovery = state.discovery_status(run_id)
+        if discovery == 'failed' or (isinstance(discovery, dict) and discovery.get('status') == 'failed'):
+            message = discovery.get('error') if isinstance(discovery, dict) else '任务发现失败'
+            state.set_run_status(run_id, 'failed', message)
+            raise RuntimeError(message)
         rows_by_group = state.grouped_result_rows(run_id)
         save_data_to_multiple_sheets(rows_by_group.get('seller', list(more_seller_info_data)), output_file)
         if state.has_incomplete_tasks(run_id):

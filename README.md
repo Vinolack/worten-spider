@@ -64,7 +64,7 @@ GUI 顶部通过功能选择切换：商品信息抓取、价格检查、跟卖�
 打包统一入口：
 
 ```bash
-pyinstaller --noconfirm --onedir --windowed --clean --name "Worten爬虫控制台V3" --add-data "cft;cft" --add-data "config.toml;." --add-data "ca.crt;seleniumwire" worten_gui.py
+pyinstaller --noconfirm --onedir --windowed --clean --name "Worten爬虫控制台V3" --collect-data seleniumwire --add-data "cft;cft" --add-data "config.toml;." worten_gui.py
 ```
 
 ## 验证

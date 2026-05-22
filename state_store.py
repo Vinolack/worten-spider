@@ -89,7 +89,11 @@ class StateStore:
                     updated_at TEXT NOT NULL,
                     started_at TEXT,
                     finished_at TEXT,
-                    error_message TEXT
+                    error_message TEXT,
+                    discovery_status TEXT NOT NULL DEFAULT 'pending',
+                    discovery_started_at TEXT,
+                    discovery_finished_at TEXT,
+                    discovery_error TEXT
                 );
                 CREATE INDEX IF NOT EXISTS idx_runs_resume
                     ON runs(mode, input_fingerprint, output_file, status);
@@ -116,6 +120,8 @@ class StateStore:
                 );
                 CREATE INDEX IF NOT EXISTS idx_tasks_status
                     ON tasks(run_id, status, lease_expires_at);
+                CREATE INDEX IF NOT EXISTS idx_tasks_claim_next
+                    ON tasks(run_id, status, lease_expires_at, created_at);
 
                 CREATE TABLE IF NOT EXISTS run_events (
                     id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -127,6 +133,18 @@ class StateStore:
                 );
                 """
             )
+            self._ensure_column(conn, "runs", "discovery_status", "TEXT NOT NULL DEFAULT 'pending'")
+            self._ensure_column(conn, "runs", "discovery_started_at", "TEXT")
+            self._ensure_column(conn, "runs", "discovery_finished_at", "TEXT")
+            self._ensure_column(conn, "runs", "discovery_error", "TEXT")
+
+    def _table_columns(self, conn: sqlite3.Connection, table: str) -> set:
+        rows = conn.execute(f"PRAGMA table_info({table})").fetchall()
+        return {row["name"] for row in rows}
+
+    def _ensure_column(self, conn: sqlite3.Connection, table: str, column: str, definition: str) -> None:
+        if column not in self._table_columns(conn, table):
+            conn.execute(f"ALTER TABLE {table} ADD COLUMN {column} {definition}")
 
     def create_or_resume_run(self, mode: str, input_file: str, output_file: str) -> Tuple[str, bool]:
         fingerprint = input_fingerprint(input_file)
@@ -193,6 +211,51 @@ class StateStore:
                 (status, error_message, now, finished_at, run_id),
             )
 
+    def mark_discovery_started(self, run_id: str) -> None:
+        now = utc_now()
+        with self.connect() as conn:
+            conn.execute(
+                """
+                UPDATE runs
+                SET discovery_status = 'running', discovery_started_at = ?, discovery_finished_at = NULL,
+                    discovery_error = NULL, updated_at = ?
+                WHERE id = ?
+                """,
+                (now, now, run_id),
+            )
+
+    def mark_discovery_finished(self, run_id: str) -> None:
+        now = utc_now()
+        with self.connect() as conn:
+            conn.execute(
+                """
+                UPDATE runs
+                SET discovery_status = 'finished', discovery_finished_at = ?, discovery_error = NULL, updated_at = ?
+                WHERE id = ?
+                """,
+                (now, now, run_id),
+            )
+
+    def mark_discovery_failed(self, run_id: str, error: str) -> None:
+        now = utc_now()
+        with self.connect() as conn:
+            conn.execute(
+                """
+                UPDATE runs
+                SET discovery_status = 'failed', discovery_finished_at = ?, discovery_error = ?, updated_at = ?
+                WHERE id = ?
+                """,
+                (now, error, now, run_id),
+            )
+
+    def discovery_status(self, run_id: str) -> str:
+        with self.connect() as conn:
+            row = conn.execute("SELECT discovery_status FROM runs WHERE id = ?", (run_id,)).fetchone()
+        return row["discovery_status"] if row else "pending"
+
+    def is_discovery_finished(self, run_id: str) -> bool:
+        return self.discovery_status(run_id) in {"finished", "failed"}
+
     def add_event(self, run_id: str, level: str, message: str, task_key: Optional[str] = None) -> None:
         with self.connect() as conn:
             conn.execute(
@@ -255,6 +318,23 @@ class StateStore:
             ).fetchall()
         return [json.loads(row["payload_json"]) for row in rows]
 
+    def recover_running_tasks(self, run_id: str, reason: str = "Worker 已退出，任务重新排队") -> int:
+        now = utc_now()
+        with self.connect() as conn:
+            cur = conn.execute(
+                """
+                UPDATE tasks
+                SET status = 'pending',
+                    last_error = COALESCE(last_error, ?),
+                    lease_owner = NULL,
+                    lease_expires_at = NULL,
+                    updated_at = ?
+                WHERE run_id = ? AND status = 'running'
+                """,
+                (reason, now, run_id),
+            )
+            return cur.rowcount
+
     def claim_task(self, run_id: str, task: Dict[str, Any], owner: str, lease_seconds: int = 900) -> bool:
         key = task.get("task_key")
         if not key:
@@ -288,22 +368,174 @@ class StateStore:
             conn.execute("COMMIT")
             return True
 
-    def complete_task(self, run_id: str, task_key: str, result_group: str, rows: Iterable[Dict[str, Any]], status: str = "succeeded", error: Optional[str] = None) -> None:
-        result_rows = list(rows)
+    def claim_next_task(
+        self,
+        run_id: str,
+        owner: str,
+        lease_seconds: int = 900,
+        task_type: Optional[str] = None,
+    ) -> Optional[Dict[str, Any]]:
+        now = utc_now()
+        lease_until = (datetime.utcnow() + timedelta(seconds=lease_seconds)).isoformat(timespec="seconds")
+        with self.connect() as conn:
+            conn.execute("BEGIN IMMEDIATE")
+            try:
+                conn.execute(
+                    """
+                    UPDATE tasks
+                    SET status = 'failed_final',
+                        last_error = COALESCE(last_error, '任务租约过期且达到最大尝试次数'),
+                        lease_owner = NULL,
+                        lease_expires_at = NULL,
+                        updated_at = ?,
+                        finished_at = ?
+                    WHERE run_id = ? AND status = 'running'
+                      AND (lease_expires_at IS NULL OR lease_expires_at < ?)
+                      AND attempts >= max_attempts
+                    """,
+                    (now, now, run_id, now),
+                )
+                conn.execute(
+                    """
+                    UPDATE tasks
+                    SET status = 'pending',
+                        last_error = COALESCE(last_error, '程序中断，任务租约已过期'),
+                        lease_owner = NULL,
+                        lease_expires_at = NULL,
+                        updated_at = ?
+                    WHERE run_id = ? AND status = 'running'
+                      AND (lease_expires_at IS NULL OR lease_expires_at < ?)
+                      AND attempts < max_attempts
+                    """,
+                    (now, run_id, now),
+                )
+                conn.execute(
+                    """
+                    UPDATE tasks
+                    SET status = 'failed_final',
+                        last_error = COALESCE(last_error, '达到最大尝试次数'),
+                        updated_at = ?,
+                        finished_at = ?
+                    WHERE run_id = ? AND status = 'pending'
+                      AND attempts >= max_attempts
+                    """,
+                    (now, now, run_id),
+                )
+                params: Tuple[Any, ...] = (run_id,)
+                type_filter = ""
+                if task_type is not None:
+                    type_filter = " AND task_type = ?"
+                    params = (run_id, task_type)
+                row = conn.execute(
+                    f"""
+                    SELECT task_key, payload_json FROM tasks
+                    WHERE run_id = ? AND status = 'pending'{type_filter}
+                      AND attempts < max_attempts
+                    ORDER BY created_at, id
+                    LIMIT 1
+                    """,
+                    params,
+                ).fetchone()
+                if row is None:
+                    conn.execute("COMMIT")
+                    return None
+                cur = conn.execute(
+                    """
+                    UPDATE tasks
+                    SET status = 'running', attempts = attempts + 1, lease_owner = ?, lease_expires_at = ?, updated_at = ?
+                    WHERE run_id = ? AND task_key = ? AND status = 'pending' AND attempts < max_attempts
+                    """,
+                    (owner, lease_until, now, run_id, row["task_key"]),
+                )
+                if cur.rowcount != 1:
+                    conn.execute("COMMIT")
+                    return None
+                conn.execute("COMMIT")
+            except Exception:
+                conn.execute("ROLLBACK")
+                raise
+        payload = json.loads(row["payload_json"])
+        payload["task_key"] = row["task_key"]
+        return payload
+
+    def release_task(
+        self,
+        run_id: str,
+        task_key: str,
+        owner: str,
+        error: Optional[str] = None,
+        consume_attempt: bool = False,
+    ) -> bool:
         now = utc_now()
         with self.connect() as conn:
+            row = conn.execute(
+                """
+                SELECT attempts FROM tasks
+                WHERE run_id = ? AND task_key = ? AND status = 'running' AND lease_owner = ?
+                """,
+                (run_id, task_key, owner),
+            ).fetchone()
+            if row is None:
+                return False
+            attempts = int(row["attempts"] or 0)
+            next_attempts = attempts if consume_attempt or attempts <= 0 else attempts - 1
             conn.execute(
                 """
                 UPDATE tasks
-                SET status = ?, result_group = ?, result_json = ?, last_error = ?, lease_owner = NULL,
-                    lease_expires_at = NULL, updated_at = ?, finished_at = ?
-                WHERE run_id = ? AND task_key = ?
+                SET status = 'pending', attempts = ?, lease_owner = NULL, lease_expires_at = NULL,
+                    last_error = ?, updated_at = ?
+                WHERE run_id = ? AND task_key = ? AND status = 'running' AND lease_owner = ?
                 """,
-                (status, result_group, json.dumps(result_rows, ensure_ascii=False), error, now, now, run_id, task_key),
+                (next_attempts, error, now, run_id, task_key, owner),
             )
+            return True
 
-    def fail_task(self, run_id: str, task_key: str, result_group: str, rows: Iterable[Dict[str, Any]], error: str) -> None:
-        self.complete_task(run_id, task_key, result_group, rows, status="failed_final", error=error)
+    def complete_task(
+        self,
+        run_id: str,
+        task_key: str,
+        result_group: str,
+        rows: Iterable[Dict[str, Any]],
+        status: str = "succeeded",
+        error: Optional[str] = None,
+        owner: Optional[str] = None,
+    ) -> bool:
+        result_rows = list(rows)
+        now = utc_now()
+        payload = json.dumps(result_rows, ensure_ascii=False)
+        with self.connect() as conn:
+            if owner is None:
+                cur = conn.execute(
+                    """
+                    UPDATE tasks
+                    SET status = ?, result_group = ?, result_json = ?, last_error = ?, lease_owner = NULL,
+                        lease_expires_at = NULL, updated_at = ?, finished_at = ?
+                    WHERE run_id = ? AND task_key = ?
+                    """,
+                    (status, result_group, payload, error, now, now, run_id, task_key),
+                )
+            else:
+                cur = conn.execute(
+                    """
+                    UPDATE tasks
+                    SET status = ?, result_group = ?, result_json = ?, last_error = ?, lease_owner = NULL,
+                        lease_expires_at = NULL, updated_at = ?, finished_at = ?
+                    WHERE run_id = ? AND task_key = ? AND status = 'running' AND lease_owner = ?
+                    """,
+                    (status, result_group, payload, error, now, now, run_id, task_key, owner),
+                )
+        return cur.rowcount == 1
+
+    def fail_task(
+        self,
+        run_id: str,
+        task_key: str,
+        result_group: str,
+        rows: Iterable[Dict[str, Any]],
+        error: str,
+        owner: Optional[str] = None,
+    ) -> bool:
+        return self.complete_task(run_id, task_key, result_group, rows, status="failed_final", error=error, owner=owner)
 
     def grouped_result_rows(self, run_id: str) -> Dict[str, List[Dict[str, Any]]]:
         grouped: Dict[str, List[Dict[str, Any]]] = {}
@@ -340,6 +572,44 @@ class StateStore:
             "processed": int(row["processed"] or 0),
             "failed": int(row["failed"] or 0),
         }
+
+    def queue_stats(self, run_id: str) -> Dict[str, int]:
+        stats = {
+            "total": 0,
+            "pending": 0,
+            "running": 0,
+            "succeeded": 0,
+            "failed_final": 0,
+            "invalid": 0,
+            "cancelled": 0,
+            "active_workers": 0,
+        }
+        with self.connect() as conn:
+            rows = conn.execute(
+                """
+                SELECT status, COUNT(*) AS count
+                FROM tasks
+                WHERE run_id = ?
+                GROUP BY status
+                """,
+                (run_id,),
+            ).fetchall()
+            for row in rows:
+                status = row["status"]
+                count = int(row["count"] or 0)
+                stats["total"] += count
+                stats[status] = count
+
+            active_workers = conn.execute(
+                """
+                SELECT COUNT(DISTINCT lease_owner) AS count
+                FROM tasks
+                WHERE run_id = ? AND status = 'running' AND lease_owner IS NOT NULL
+                """,
+                (run_id,),
+            ).fetchone()
+            stats["active_workers"] = int(active_workers["count"] or 0)
+        return stats
 
     def has_incomplete_tasks(self, run_id: str) -> bool:
         with self.connect() as conn:

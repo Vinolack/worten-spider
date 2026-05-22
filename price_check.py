@@ -182,46 +182,57 @@ def parse_pages_to_scrape(pages_value):
     return parse_pages_to_scrape_shared(pages_value, SELLER_SCRAPED_PAGE_COUNT)
 
 
-def discovery_process_with_progress(initial_urls, url_queue, session_queue, discovery_completed_event, log_queue, total_estimated, total_increment_queue, all_product_data, results_lock, state_db_path=None, run_id=None):
+def discovery_process_with_progress(initial_urls, session_queue, discovery_completed_event, log_queue, total_estimated, total_increment_queue, all_product_data, results_lock, state_db_path=None, run_id=None):
     setup_log_queue_handler(log_queue)
     logging.info("--- [发现进程] 启动 ---")
     total_estimated.value = 0
     state = StateStore(state_db_path) if state_db_path and run_id else None
 
     queued_count = 0
+    try:
+        if state:
+            state.mark_discovery_started(run_id)
 
-    # 发现进程只展开输入链接为待处理任务，不打开列表页。
-    for item in initial_urls:
-        url = item.get('url')
-        if not url:
-            continue
+        # 发现进程只展开输入链接为待处理任务，不打开列表页。
+        for item in initial_urls:
+            url = item.get('url')
+            if not url:
+                continue
 
-        if is_product_page_url(url):
-            task = {'url': url, 'type': 'product_page'}
-            if not state or state.add_task(run_id, task, 'price_check', max_attempts=URL_RETRY_LIMIT + 1):
-                url_queue.put(task)
-                total_estimated.value += 1
-                queued_count += 1
-            continue
+            if is_product_page_url(url):
+                task = {'url': url, 'type': 'product_page'}
+                if not state or state.add_task(run_id, task, 'price_check', max_attempts=URL_RETRY_LIMIT + 1):
+                    if total_increment_queue:
+                        total_increment_queue.put(1)
+                    queued_count += 1
+                continue
 
-        seller_id = extract_seller_id(url)
-        if seller_id:
-            target_url = seller_search_url(seller_id)
-        else:
-            target_url = url
+            seller_id = extract_seller_id(url)
+            if seller_id:
+                target_url = seller_search_url(seller_id)
+            else:
+                target_url = url
 
-        pages = parse_pages_to_scrape(item.get('pages_to_scrape'))
-        logging.info(f"[发现进程] 正在展开任务: {target_url} (页数: {list(pages)})")
-        for page_num in pages:
-            p_url = append_page_param(target_url, page_num)
-            task = {'url': p_url, 'type': 'listing_page', 'source_url': url, 'page': page_num}
-            if not state or state.add_task(run_id, task, 'price_check', max_attempts=URL_RETRY_LIMIT + 1):
-                url_queue.put(task)
-                total_estimated.value += 1
-                queued_count += 1
+            pages = parse_pages_to_scrape(item.get('pages_to_scrape'))
+            logging.info(f"[发现进程] 正在展开任务: {target_url} (页数: {list(pages)})")
+            for page_num in pages:
+                p_url = append_page_param(target_url, page_num)
+                task = {'url': p_url, 'type': 'listing_page', 'source_url': url, 'page': page_num}
+                if not state or state.add_task(run_id, task, 'price_check', max_attempts=URL_RETRY_LIMIT + 1):
+                    if total_increment_queue:
+                        total_increment_queue.put(1)
+                    queued_count += 1
 
-    logging.info(f"[发现进程] 已分发所有任务，共 {queued_count} 个。")
-    discovery_completed_event.set()
+        if state:
+            state.mark_discovery_finished(run_id)
+        logging.info(f"[发现进程] 已写入所有任务，共 {queued_count} 个。")
+    except Exception as e:
+        logging.error(f"[发现进程] 任务发现失败: {e}")
+        if state:
+            state.mark_discovery_failed(run_id, str(e))
+        raise
+    finally:
+        discovery_completed_event.set()
 
 # --- 业务逻辑 ---
 
@@ -334,8 +345,7 @@ def scrape_listing_page_prices(driver: uc.Chrome, listing_url: str) -> Optional[
 # --- Worker  ---
 
 class ScraperWorker:
-    def __init__(self, url_queue, all_product_data, results_lock, session_queue, discovery_completed_event, log_queue=None, increment_queue=None, state_db_path=None, run_id=None):
-        self.url_queue = url_queue
+    def __init__(self, all_product_data, results_lock, session_queue, discovery_completed_event, log_queue=None, increment_queue=None, state_db_path=None, run_id=None, stop_flag=None):
         self.all_product_data = all_product_data
         self.results_lock = results_lock
         self.session_queue = session_queue
@@ -344,6 +354,7 @@ class ScraperWorker:
         self.increment_queue = increment_queue
         self.state_db_path = state_db_path
         self.run_id = run_id
+        self.stop_flag = stop_flag
         self.state = StateStore(state_db_path) if state_db_path and run_id else None
         self.worker_id = str(uuid.uuid4())[:8]
         self.driver = None
@@ -375,60 +386,121 @@ class ScraperWorker:
 
     def run(self):
         setup_log_queue_handler(self.log_queue)
-        while True:
-            try:
-                task = self.url_queue.get(block=True, timeout=2)
-            except queue.Empty:
-                if self.discovery_completed_event.is_set(): break
-                else: continue
+        if not self.state:
+            logging.error(f"[Worker {self.worker_id}] 状态存储不可用，Worker 退出。")
+            return
 
-            if self.driver is None:
-                if not self.setup_driver():
-                    self.url_queue.put(task)
+        task_key = None
+        try:
+            while True:
+                if self.stop_flag is not None and self.stop_flag.value:
                     break
 
-            if self.processed_count >= self.current_max_urls:
-                self.teardown_driver()
-                if not self.setup_driver():
-                    self.url_queue.put(task)
+                task = self.state.claim_next_task(self.run_id, self.worker_id)
+                if not task:
+                    if self.state.is_discovery_finished(self.run_id):
+                        break
+                    time.sleep(2)
+                    continue
+
+                task_key = task.get('task_key')
+                if self.stop_flag is not None and self.stop_flag.value:
+                    if task_key:
+                        self.state.release_task(self.run_id, task_key, self.worker_id, consume_attempt=False, error='任务已停止')
+                    task_key = None
                     break
 
-            # 处理任务并发送进度信号
-            success = self.process_task(task)
-            if self.increment_queue:
-                self.increment_queue.put(1) # 进度+1
+                if self.driver is None:
+                    if not self.setup_driver():
+                        if task_key:
+                            self.state.release_task(self.run_id, task_key, self.worker_id, consume_attempt=False, error='driver_setup_failed')
+                        task_key = None
+                        break
 
-            if success: self.consecutive_failures = 0
-            else: self.consecutive_failures += 1
-            self.processed_count += 1
+                if self.processed_count >= self.current_max_urls:
+                    logging.info(f"[Worker {self.worker_id}] 轮换 Driver...")
+                    self.teardown_driver()
+                    if not self.setup_driver():
+                        if task_key:
+                            self.state.release_task(self.run_id, task_key, self.worker_id, consume_attempt=False, error='driver_rotation_failed')
+                        task_key = None
+                        break
 
-            if self.consecutive_failures >= 3:
-                self.teardown_driver()
-                self.consecutive_failures = 0
-        self.teardown_driver()
+                # 处理任务并发送进度信号
+                success = self.process_task(task)
+                task_key = None
+                if self.increment_queue:
+                    self.increment_queue.put(1) # 进度+1
+
+                if success: self.consecutive_failures = 0
+                else: self.consecutive_failures += 1
+                self.processed_count += 1
+
+                if self.consecutive_failures >= 3:
+                    self.teardown_driver()
+                    self.consecutive_failures = 0
+        except Exception as exc:
+            logging.error(f"[Worker {self.worker_id}] Worker 异常退出: {exc}")
+            if task_key:
+                self.state.release_task(self.run_id, task_key, self.worker_id, consume_attempt=False, error=str(exc))
+            raise
+        finally:
+            self.teardown_driver()
+
+    def record_task_result(self, task_key, result_group, rows, status='succeeded', error=None):
+        result_rows = list(rows)
+        if self.state and task_key:
+            saved = self.state.complete_task(
+                self.run_id,
+                task_key,
+                result_group,
+                result_rows,
+                status=status,
+                error=error,
+                owner=self.worker_id,
+            )
+            if not saved:
+                logging.warning(f"[Worker {self.worker_id}] 任务 lease 已失效，丢弃本地结果: {task_key}")
+                return False
+        with self.results_lock:
+            for row in result_rows:
+                self.all_product_data.append(row)
+        return True
+
+    def record_task_failure(self, task_key, result_group, rows, error):
+        result_rows = list(rows)
+        if self.state and task_key:
+            saved = self.state.fail_task(
+                self.run_id,
+                task_key,
+                result_group,
+                result_rows,
+                error,
+                owner=self.worker_id,
+            )
+            if not saved:
+                logging.warning(f"[Worker {self.worker_id}] 任务 lease 已失效，丢弃失败结果: {task_key}")
+                return False
+        with self.results_lock:
+            for row in result_rows:
+                self.all_product_data.append(row)
+        return True
 
     def process_task(self, task):
         url = task['url']
         task_key = task.get('task_key')
-        if self.state and not self.state.claim_task(self.run_id, task, self.worker_id):
-            return True
         if task.get('type') == 'listing_page':
             rows = scrape_listing_page_prices(self.driver, url)
             if rows is None:
                 failed_row = price_failure_row(url, '列表页抓取失败')
-                with self.results_lock:
-                    self.all_product_data.append(failed_row)
-                if self.state and task_key:
-                    self.state.fail_task(self.run_id, task_key, 'price', [failed_row], '列表页抓取失败')
+                self.record_task_failure(task_key, 'price', [failed_row], '列表页抓取失败')
                 return False
             if not rows:
                 rows = [price_failure_row(url, '列表页无商品')]
-            with self.results_lock:
-                for row in rows:
-                    self.all_product_data.append(row)
-            if self.state and task_key:
-                self.state.complete_task(self.run_id, task_key, 'price', rows)
-            return True
+            saved = self.record_task_result(task_key, 'price', rows)
+            if saved:
+                logging.info(f"[Worker {self.worker_id}] 成功处理列表页: {url}，抓取到 {len(rows)} 条价格数据。")
+            return saved
 
         try:
             for attempt in range(URL_RETRY_LIMIT + 1):
@@ -437,17 +509,11 @@ class ScraperWorker:
                     status = data.get('_status')
                     if status == 'invalid':
                         row = price_failure_row(url, '失效链接')
-                        with self.results_lock: self.all_product_data.append(row)
-                        if self.state and task_key:
-                            self.state.complete_task(self.run_id, task_key, 'price', [row], status='invalid', error='失效链接')
-                        return True
+                        return self.record_task_result(task_key, 'price', [row], status='invalid', error='失效链接')
                     elif status == 'page_load_failed':
                         if attempt == URL_RETRY_LIMIT:
                             row = price_failure_row(url, '抓取失败')
-                            with self.results_lock:
-                                self.all_product_data.append(row)
-                            if self.state and task_key:
-                                self.state.fail_task(self.run_id, task_key, 'price', [row], data.get('_error') or '抓取失败')
+                            self.record_task_failure(task_key, 'price', [row], data.get('_error') or '抓取失败')
                             return False
                         continue # 重试
 
@@ -456,24 +522,19 @@ class ScraperWorker:
                     logging.warning(f"[Worker {self.worker_id}] 运费为空，重试...")
                     if attempt == URL_RETRY_LIMIT:
                         row = price_failure_row(url, '抓取失败')
-                        with self.results_lock: self.all_product_data.append(row)
-                        if self.state and task_key:
-                            self.state.fail_task(self.run_id, task_key, 'price', [row], '运费为空')
+                        self.record_task_failure(task_key, 'price', [row], '运费为空')
                         return False
                     continue
                 
                 data['商品链接'] = url
-                with self.results_lock: self.all_product_data.append(data)
-                if self.state and task_key:
-                    self.state.complete_task(self.run_id, task_key, 'price', [data])
-                return True
+                saved = self.record_task_result(task_key, 'price', [data])
+                if saved:
+                    logging.info(f"[Worker {self.worker_id}] 成功处理商品价格: {url}")
+                return saved
         except Exception as e:
             logging.error(f"Worker Error: {e}")
             row = price_failure_row(url, '抓取失败')
-            with self.results_lock:
-                self.all_product_data.append(row)
-            if self.state and task_key:
-                self.state.fail_task(self.run_id, task_key, 'price', [row], str(e))
+            self.record_task_failure(task_key, 'price', [row], str(e))
             return False
         return False
 
@@ -526,7 +587,11 @@ def main(progress_callback=None, stop_check_callback=None, input_file=None, outp
     run_id, resumed = state.create_or_resume_run('price_check', input_file, output_file)
     if resumed:
         logging.info(f"继续未完成任务: run_id={run_id}, output_file={output_file}")
-    state.recover_stale_tasks(run_id)
+        recovered = state.recover_running_tasks(run_id, '程序重新启动，任务重新排队')
+        if recovered:
+            logging.info(f"已恢复 {recovered} 个上次运行遗留的进行中任务。")
+    else:
+        state.recover_stale_tasks(run_id)
 
     def _log_listener(q):
         root = logging.getLogger()
@@ -542,7 +607,6 @@ def main(progress_callback=None, stop_check_callback=None, input_file=None, outp
         listener_thread = threading.Thread(target=_log_listener, args=(log_queue,), daemon=True)
         listener_thread.start()
 
-        url_queue = manager.Queue()
         session_queue = manager.Queue()
         stop_flag = manager.Value('b', False)
         discovery_completed_event = manager.Event()
@@ -563,6 +627,7 @@ def main(progress_callback=None, stop_check_callback=None, input_file=None, outp
 
         # 进度回调线程
         def progress_updater():
+            last_queue_log = 0
             while not stop_flag.value:
                 if progress_callback:
                     elapsed = time.time() - start_time.value
@@ -574,6 +639,19 @@ def main(progress_callback=None, stop_check_callback=None, input_file=None, outp
                         'rate': rate,
                         'message': f"正在检查价格: {progress['processed']}/{progress['total'] or total_estimated.value}"
                     })
+
+                now = time.time()
+                if now - last_queue_log >= 10:
+                    stats = state.queue_stats(run_id)
+                    discovery = state.discovery_status(run_id)
+                    logging.info(
+                        f"[队列状态] discovery={discovery}, total={stats['total']}, "
+                        f"pending={stats['pending']}, running={stats['running']}, "
+                        f"active_workers={stats['active_workers']}/{MAX_WORKERS}, succeeded={stats['succeeded']}, "
+                        f"failed_final={stats['failed_final']}, invalid={stats['invalid']}"
+                    )
+                    last_queue_log = now
+
                 if stop_check_callback and stop_check_callback():
                     stop_flag.value = True
                 time.sleep(2)
@@ -582,28 +660,42 @@ def main(progress_callback=None, stop_check_callback=None, input_file=None, outp
         updater_t.start()
 
         # 启动组件
-        for task in state.load_unfinished_tasks(run_id):
-            url_queue.put(task)
-        producers = [multiprocessing.Process(target=session_producer, args=(session_queue, stop_flag, cf_port, num_producers, log_queue)) for _ in range(num_producers)]
-        for p in producers: p.start()
-        time.sleep(10)
+        producers = []
+        discovery_p = None
+        try:
+            producers = [multiprocessing.Process(target=session_producer, args=(session_queue, stop_flag, cf_port, num_producers, log_queue)) for _ in range(num_producers)]
+            for p in producers: p.start()
+            time.sleep(10)
 
-        discovery_p = multiprocessing.Process(target=discovery_process_with_progress, args=(initial_urls, url_queue, session_queue, discovery_completed_event, log_queue, total_estimated, total_increment_queue, all_product_data, results_lock, state_db_path, run_id))
-        discovery_p.start()
-        discovery_p.join()
+            discovery_p = multiprocessing.Process(target=discovery_process_with_progress, args=(initial_urls, session_queue, discovery_completed_event, log_queue, total_estimated, total_increment_queue, all_product_data, results_lock, state_db_path, run_id))
+            discovery_p.start()
 
-        with ProcessPoolExecutor(max_workers=MAX_WORKERS) as executor:
-            futures = [executor.submit(ScraperWorker(url_queue, all_product_data, results_lock, session_queue, discovery_completed_event, log_queue, increment_queue, state_db_path, run_id).run) for _ in range(MAX_WORKERS)]
-            wait(futures)
-            for future in futures:
-                future.result()
-
-        # 收尾
-        stop_flag.value = True
-        log_queue.put(None)
-        for p in producers: p.join(timeout=5)
-        pm_p.join(timeout=5)
+            with ProcessPoolExecutor(max_workers=MAX_WORKERS) as executor:
+                futures = [executor.submit(ScraperWorker(all_product_data, results_lock, session_queue, discovery_completed_event, log_queue, increment_queue, state_db_path, run_id, stop_flag).run) for _ in range(MAX_WORKERS)]
+                wait(futures)
+                for future in futures:
+                    future.result()
+        finally:
+            stop_flag.value = True
+            try:
+                log_queue.put(None)
+            except Exception:
+                pass
+            if discovery_p is not None:
+                discovery_p.join(timeout=5)
+                if discovery_p.is_alive():
+                    discovery_p.terminate()
+            for p in producers:
+                p.join(timeout=5)
+                if p.is_alive():
+                    p.terminate()
+            pm_p.join(timeout=5)
+            if pm_p.is_alive():
+                pm_p.terminate()
         
+        if state.discovery_status(run_id) == 'failed':
+            state.set_run_status(run_id, 'failed', '任务发现失败')
+            raise RuntimeError('任务发现失败')
         rows_by_group = state.grouped_result_rows(run_id)
         save_data_to_excel(rows_by_group.get('price', list(all_product_data)), output_file)
         if state.has_incomplete_tasks(run_id):

@@ -1,26 +1,23 @@
 import ssl
 import certifi
 import os
-import sys
 import time
-import json
 import uuid
 import random
-import psutil
-import string
 import logging
 import threading
+import warnings
 from io import BytesIO
 from logging.handlers import QueueHandler
 import requests
 import pandas as pd
+from urllib3.exceptions import InsecureRequestWarning
 import multiprocessing
 import subprocess
-import queue
 from datetime import datetime
 from concurrent.futures import ProcessPoolExecutor, wait, FIRST_COMPLETED
 from typing import List, Dict, Optional, Any, Tuple
-from urllib.parse import urlsplit, urlunsplit, urljoin
+from urllib.parse import unquote, urlsplit, urlunsplit, urljoin
 
 # Selenium
 import seleniumwire.undetected_chromedriver as uc
@@ -78,8 +75,8 @@ URL_RETRY_LIMIT = 5
 
 MAX_WORKERS = int(c.get_key('MAX_WORKER') or 4)
 # 默认每个 Driver 处理多少个 URL 后重启
-DEFAULT_MAX_URLS_PER_DRIVER_MIN = 15
-DEFAULT_MAX_URLS_PER_DRIVER_MAX = 20
+DEFAULT_MAX_URLS_PER_DRIVER_MIN = 20
+DEFAULT_MAX_URLS_PER_DRIVER_MAX = 30
 
 SESSION_LIFESPAN_SECONDS = 10 * 60
 MIN_SESSION_USABLE_TIME_SECONDS = 4 * 60
@@ -169,56 +166,236 @@ def navigate_with_retries(driver: uc.Chrome, url: str, max_attempts: int = 3, ba
     return browser_runtime.navigate_with_retries(driver, url, max_attempts, backoff_base)
        
 # ---  Image Download and Upload Functions ---
+IMAGE_DOWNLOAD_FAILED = "fail"
+IMAGE_SOURCE_INVALID = "图片源文件失效"
+
+
 def build_requests_proxy_url(session_id: Optional[str] = None) -> Optional[str]:
     return browser_runtime.build_requests_proxy_url(c, session_id)
 
 
-def _filename_from_image_url(url: str) -> str:
-    path = urlsplit(url).path
+def _image_extension_from_content(content: bytes, content_type: str, fallback_url: str) -> str:
+    content_type = (content_type or '').split(';', 1)[0].strip().lower()
+    content_type_map = {
+        'image/jpeg': '.jpg',
+        'image/jpg': '.jpg',
+        'image/png': '.png',
+        'image/gif': '.gif',
+        'image/webp': '.webp',
+        'image/avif': '.avif',
+        'image/svg+xml': '.svg',
+    }
+    if content_type in content_type_map:
+        return content_type_map[content_type]
+    if content.startswith(b'\xff\xd8\xff'):
+        return '.jpg'
+    if content.startswith(b'\x89PNG\r\n\x1a\n'):
+        return '.png'
+    if content.startswith((b'GIF87a', b'GIF89a')):
+        return '.gif'
+    if content.startswith(b'RIFF'):
+        return '.webp'
+    if content.startswith((b'\x00\x00\x00\x18ftypavif', b'\x00\x00\x00\x1cftypavif')):
+        return '.avif'
+
+    path = urlsplit(fallback_url).path
     ext = os.path.splitext(path)[1].lower()
     if not ext or len(ext) > 10 or not ext[1:].isalnum():
         ext = '.jpg'
-    return f"{uuid.uuid4()}{ext}"
+    return ext
 
 
-def download_image(url: str, timeout: int = 30, proxy_url: Optional[str] = None) -> Optional[Tuple[bytes, str]]:
-    headers = {'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/58.0.3029.110 Safari/537.3'}
-    filename = _filename_from_image_url(url)
+def _filename_for_image(content: bytes, content_type: str, fallback_url: str) -> str:
+    return f"{uuid.uuid4()}{_image_extension_from_content(content, content_type, fallback_url)}"
 
+
+def _strip_image_size_suffix(url: str) -> str:
+    parts = list(urlsplit(url))
+    if parts[2].endswith('_zoom'):
+        parts[2] = parts[2][:-5]
+    return urlunsplit(parts)
+
+
+def normalize_image_url(raw_url: str) -> Optional[str]:
+    raw_url = (raw_url or '').strip()
+    if not raw_url:
+        return None
+    if raw_url.startswith('//'):
+        raw_url = f"https:{raw_url}"
+
+    url = urljoin(BASE_URL, raw_url)
+    parsed = urlsplit(url)
+    path = unquote(parsed.path)
+    if path.startswith('/i/http://') or path.startswith('/i/https://'):
+        url = path[3:]
+        if parsed.query:
+            url = f"{url}?{parsed.query}"
+
+    return _strip_image_size_suffix(url)
+
+
+def _image_download_headers() -> Dict[str, str]:
+    return {
+        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36',
+        'Accept': 'image/avif,image/webp,image/apng,image/svg+xml,image/*,*/*;q=0.8',
+        'Accept-Language': 'pt-PT,pt;q=0.9,en;q=0.8',
+        'Referer': BASE_URL,
+    }
+
+
+class NonImageContentError(requests.exceptions.RequestException):
+    pass
+
+
+def _image_download_failure_value(error: Optional[Exception]) -> str:
+    if isinstance(error, NonImageContentError):
+        return IMAGE_SOURCE_INVALID
+    return IMAGE_DOWNLOAD_FAILED
+
+
+def _looks_like_image(content: bytes, content_type: str) -> bool:
+    # Some bad image endpoints return HTTP 200 and even image/jpeg while serving a non-image body.
+    signatures = (
+        b'\xff\xd8\xff',
+        b'\x89PNG\r\n\x1a\n',
+        b'GIF87a',
+        b'GIF89a',
+        b'RIFF',
+        b'\x00\x00\x00\x18ftypavif',
+        b'\x00\x00\x00\x1cftypavif',
+    )
+    return any(content.startswith(signature) for signature in signatures)
+
+
+def _is_retryable_network_error(error: Exception) -> bool:
+    return isinstance(error, (
+        requests.exceptions.ConnectionError,
+        requests.exceptions.Timeout,
+        requests.exceptions.SSLError,
+        requests.exceptions.ChunkedEncodingError,
+        requests.exceptions.ContentDecodingError,
+    ))
+
+
+def _request_image(
+    url: str,
+    headers: Dict[str, str],
+    timeout: int,
+    proxies: Optional[Dict[str, str]],
+    verify: Any,
+    attempts: int,
+    label: str,
+) -> Tuple[Optional[bytes], Optional[str], Optional[Exception], bool]:
     last_error = None
-    for attempt in range(MAX_RETRIES):
+    saw_ssl_error = False
+    for attempt in range(attempts):
         try:
-            response = requests.get(url, headers=headers, timeout=timeout)
+            kwargs = {
+                'headers': headers,
+                'timeout': timeout,
+                'proxies': proxies,
+                'verify': verify,
+            }
+            if verify is False:
+                with warnings.catch_warnings():
+                    warnings.simplefilter('ignore', InsecureRequestWarning)
+                    response = requests.get(url, **kwargs)
+            else:
+                response = requests.get(url, **kwargs)
             response.raise_for_status()
-            return response.content, filename
+            content = response.content
+            content_type = response.headers.get('Content-Type', '')
+            if not _looks_like_image(content, content_type):
+                raise NonImageContentError(f"NotImageContent:{content_type or 'unknown'}")
+            return content, content_type, None, saw_ssl_error
+        except requests.exceptions.SSLError as e:
+            last_error = e
+            saw_ssl_error = True
+            logging.info(f"[图片{label}重试 {attempt+1}/{attempts}] {url} - SSLError")
         except requests.exceptions.RequestException as e:
             last_error = e
-            logging.info(f"[图片本地下载重试 {attempt+1}/{MAX_RETRIES}] {url} - {e.__class__.__name__}")
-            if attempt < MAX_RETRIES - 1:
-                time.sleep(2 ** attempt)
+            if not _is_retryable_network_error(e):
+                logging.warning(f"[图片{label}失败-不重试] {url} - {e}")
+                break
+            logging.info(f"[图片{label}重试 {attempt+1}/{attempts}] {url} - {e.__class__.__name__}")
+        if attempt < attempts - 1:
+            time.sleep(2 ** attempt)
+    return None, None, last_error, saw_ssl_error
+
+
+def download_image(url: str, timeout: int = 30, proxy_url: Optional[str] = None) -> Tuple[Optional[bytes], str, str]:
+    headers = _image_download_headers()
+    verify_bundle = certifi.where()
+
+    content, content_type, last_error, saw_ssl_error = _request_image(
+        url, headers, timeout, proxies=None, verify=verify_bundle, attempts=MAX_RETRIES, label='本地下载'
+    )
+    if content is not None:
+        return content, _filename_for_image(content, content_type or '', url), content_type or ''
+    if last_error and not _is_retryable_network_error(last_error):
+        failure_value = _image_download_failure_value(last_error)
+        logging.error(f"图片下载失败: {url} - {last_error}, output_value={failure_value}")
+        return None, failure_value, ''
 
     proxy_url = proxy_url or build_requests_proxy_url()
-    if not proxy_url:
-        logging.error(f"下载失败且未配置代理: {url} - {last_error.__class__.__name__ if last_error else 'UnknownError'}")
-        return None
+    proxies = {"http": proxy_url, "https": proxy_url} if proxy_url else None
+    if proxies:
+        content, content_type, proxy_error, proxy_ssl_error = _request_image(
+            url, headers, timeout, proxies=proxies, verify=verify_bundle, attempts=MAX_RETRIES, label='代理下载'
+        )
+        if content is not None:
+            return content, _filename_for_image(content, content_type or '', url), content_type or ''
+        last_error = proxy_error or last_error
+        saw_ssl_error = saw_ssl_error or proxy_ssl_error
+    else:
+        logging.info(f"图片下载未配置代理，跳过代理重试: {url}")
 
-    proxies = {"http": proxy_url, "https": proxy_url}
-    for attempt in range(MAX_RETRIES):
-        try:
-            response = requests.get(url, headers=headers, timeout=timeout, proxies=proxies)
-            response.raise_for_status()
-            return response.content, filename
-        except requests.exceptions.RequestException as e:
-            last_error = e
-            logging.info(f"[图片代理下载重试 {attempt+1}/{MAX_RETRIES}] {url} - {e.__class__.__name__}")
-            if attempt < MAX_RETRIES - 1:
-                time.sleep(2 ** attempt)
+    if saw_ssl_error:
+        host = urlsplit(url).netloc
+        logging.warning(f"[图片SSL兜底] 证书校验失败，尝试关闭校验下载: host={host}, url={url}")
+        content, content_type, fallback_error, _ = _request_image(
+            url, headers, timeout, proxies=None, verify=False, attempts=1, label='SSL兜底本地下载'
+        )
+        if content is not None:
+            return content, _filename_for_image(content, content_type or '', url), content_type or ''
+        last_error = fallback_error or last_error
+
+        if proxies:
+            content, content_type, fallback_proxy_error, _ = _request_image(
+                url, headers, timeout, proxies=proxies, verify=False, attempts=1, label='SSL兜底代理下载'
+            )
+            if content is not None:
+                return content, _filename_for_image(content, content_type or '', url), content_type or ''
+            last_error = fallback_proxy_error or last_error
 
     error_name = last_error.__class__.__name__ if last_error else "UnknownError"
-    logging.error(f"代理下载失败: {url} - {error_name}")
+    failure_value = _image_download_failure_value(last_error)
+    logging.error(f"图片下载失败: {url} - {error_name}, output_value={failure_value}")
+    return None, failure_value, ''
+
+def _extract_uploaded_url(payload: Any) -> Optional[str]:
+    if not isinstance(payload, dict):
+        return None
+    direct_url = payload.get('url')
+    if isinstance(direct_url, str) and direct_url.strip():
+        return direct_url.strip()
+
+    data = payload.get('data')
+    if isinstance(data, dict):
+        data_url = data.get('url')
+        if isinstance(data_url, str) and data_url.strip():
+            return data_url.strip()
     return None
 
-def upload_to_image_host(image_content: bytes, filename: str) -> Optional[str]:
+
+def _response_preview(response: requests.Response, limit: int = 500) -> str:
+    try:
+        return response.text[:limit].replace('\n', ' ').replace('\r', ' ')
+    except Exception:
+        return '<response text unavailable>'
+
+
+def upload_to_image_host(image_content: bytes, filename: str, source_url: str = '', content_type: str = '', product_url: str = '') -> Optional[str]:
     for attempt in range(MAX_RETRIES):
         try:
             image_file = BytesIO(image_content)
@@ -229,14 +406,29 @@ def upload_to_image_host(image_content: bytes, filename: str) -> Optional[str]:
                 timeout=10 * (attempt + 1)
             )
             if response.ok:
-                original_url = response.json()['url']
-                parts = list(urlsplit(original_url))
-                parts[1] = "gbcm-imagehost.vshare.dev" # 替换域名
-                return urlunsplit(parts)
-            logging.error(f"[Retry {attempt+1}] 上传失败 HTTP {response.status_code}")
+                try:
+                    payload = response.json()
+                except ValueError:
+                    logging.error(f"[Retry {attempt+1}] 上传返回非JSON: {response.status_code}, product_url={product_url}, filename={filename}, content_type={content_type or 'unknown'}, source_url={source_url}, body={_response_preview(response)}")
+                    payload = None
+
+                original_url = _extract_uploaded_url(payload)
+                if original_url:
+                    parts = list(urlsplit(original_url))
+                    parts[1] = "gbcm-imagehost.vshare.dev" # 替换域名
+                    return urlunsplit(parts)
+
+                logging.error(f"[Retry {attempt+1}] 上传响应缺少url字段，不重试: {response.status_code}, product_url={product_url}, filename={filename}, content_type={content_type or 'unknown'}, source_url={source_url}, body={_response_preview(response)}")
+                break
+            else:
+                logging.error(f"[Retry {attempt+1}] 上传失败 HTTP {response.status_code}, product_url={product_url}, filename={filename}, content_type={content_type or 'unknown'}, source_url={source_url}, body={_response_preview(response)}")
+                if response.status_code < 500 and response.status_code != 429:
+                    break
         except Exception as e:
-            logging.error(f"[Retry {attempt+1}] 上传异常: {str(e)}")
-        if attempt < MAX_RETRIES:
+            logging.error(f"[Retry {attempt+1}] 上传异常: product_url={product_url}, filename={filename}, content_type={content_type or 'unknown'}, source_url={source_url}, error={str(e)}")
+            if not _is_retryable_network_error(e):
+                break
+        if attempt < MAX_RETRIES - 1:
             time.sleep(2 ** (attempt + 1))
     return None
 
@@ -401,25 +593,30 @@ def scrape_product_details(driver: uc.Chrome, product_url: str, proxy_url: Optio
         image_urls = []
         img_elements = driver.find_elements(By.CSS_SELECTOR, "img.product-gallery__slider-image")
         for img in img_elements:
-            src = img.get_attribute('src')
-            if src:
-                image_urls.append(urljoin(BASE_URL, src))
+            raw_src = img.get_attribute('src')
+            normalized_url = normalize_image_url(raw_src)
+            if normalized_url:
+                image_urls.append({'raw_src': raw_src, 'normalized_url': normalized_url})
+                if raw_src and raw_src != normalized_url:
+                    logging.info(f"[图片URL规范化] product_url={product_url}, raw_src={raw_src}, normalized_url={normalized_url}")
 
-        for image_index, url in enumerate(image_urls[:5], start=1):
+        for image_index, image_info in enumerate(image_urls[:5], start=1):
             image_key = f"图{image_index}"
-            downloaded_image = download_image(url, proxy_url=proxy_url)
-            if not downloaded_image:
-                details[image_key] = "fail"
-                logging.warning(f"图片下载失败，已标记为 fail: {url}")
+            raw_src = image_info['raw_src']
+            url = image_info['normalized_url']
+            image_content, filename_or_failure, content_type = download_image(url, proxy_url=proxy_url)
+            if image_content is None:
+                details[image_key] = filename_or_failure
+                logging.warning(f"图片下载失败，已标记为 {filename_or_failure}: product_url={product_url}, raw_src={raw_src}, normalized_url={url}")
                 continue
 
-            image_content, filename = downloaded_image
-            uploaded_url = upload_to_image_host(image_content, filename)
+            filename = filename_or_failure
+            uploaded_url = upload_to_image_host(image_content, filename, source_url=url, content_type=content_type, product_url=product_url)
             if uploaded_url:
                 details[image_key] = uploaded_url
             else:
                 details[image_key] = "fail"
-                logging.warning(f"图片上传失败，已标记为 fail: {url}")
+                logging.warning(f"图片上传失败，已标记为 fail: product_url={product_url}, raw_src={raw_src}, normalized_url={url}, filename={filename}, content_type={content_type or 'unknown'}")
 
         # 5. Price, Seller, Shipping
         try: details["价格"] = driver.find_element(By.CSS_SELECTOR, "span[class='price--lg price--mixed price--B price'] span[class='price__numbers--bold price__numbers notranslate raised-decimal price__numbers--bold price__numbers']").text.strip()
@@ -664,8 +861,8 @@ def create_chrome_driver(session_data: Dict) -> Optional[uc.Chrome]:
 
 # --- 生产者与会话管理 ---
 
-def session_producer(session_queue: multiprocessing.Queue, url_queue: multiprocessing.Queue, 
-                     stop_flag, port: int, num_producers: int,log_queue: multiprocessing.Queue):
+def session_producer(session_queue: multiprocessing.Queue, stop_flag,
+                     port: int, num_producers: int, log_queue: multiprocessing.Queue):
     """
     会话生产者：持续生成 CF 可用的 Session 并放入 session_queue。
     """
@@ -675,12 +872,8 @@ def session_producer(session_queue: multiprocessing.Queue, url_queue: multiproce
 
     while not stop_flag.value:
         try:
-            url_count = url_queue.qsize()
             current_session_count = session_queue.qsize()
-            
             target = int(MAX_WORKERS / 2 + shutdown_buffer)
-            if url_count == 0:
-                 target = shutdown_buffer # 维持最低库存
 
             if current_session_count < target:
                 session_data = browser_runtime.create_session_data(c, port)
@@ -703,319 +896,161 @@ def get_fresh_session(session_queue: multiprocessing.Queue):
     return browser_runtime.get_fresh_session(session_queue, SESSION_LIFESPAN_SECONDS, MIN_SESSION_USABLE_TIME_SECONDS)
 
 
-def discovery_process(initial_urls: List[Dict], url_queue: multiprocessing.Queue,
-                      session_queue: multiprocessing.Queue, discovery_completed_event, log_queue, total_increment_queue):
+def discovery_process_with_progress(initial_urls: List[Dict], session_queue: multiprocessing.Queue,
+                                   discovery_completed_event, log_queue, total_estimated, total_increment_queue,
+                                   state_db_path=None, run_id=None):
     """
-    发现进程：处理初始 URL，分类并展开为具体的可抓取页面 URL。
-    1. 直接分类为卖家页面或商品页面的，直接放入 url_queue。
-    2. 店铺页或类目页的，进行展开处理，生成具体的分页 URL 放入 url_queue。
+    支持进度跟踪的发现进程。任务只写入 StateStore。
     """
-    # 1. 配置日志
     setup_log_queue_handler(log_queue)
     logging.info("--- [发现进程] 启动 ---")
-    
-    expansion_tasks = []
-    
-    # 1. 快速分类
-    for item in initial_urls:
-        url = item['url']
-        if 'marketplace-see-more-offers' in url and 'product_id' in url:
-            url_queue.put({'url': url, 'type': 'seller_page'})
-        elif 'produtos/' in url:
-            url_queue.put({'url': url, 'type': 'product_page'})
-        elif 'seller_id' in url:
-            expansion_tasks.append({'url': url, 'type': 'shop_page', 'pages': item.get('pages_to_scrape')})
-        else:
-            expansion_tasks.append({'url': url, 'type': 'category_page', 'pages': item.get('pages_to_scrape')})
+    state = StateStore(state_db_path) if state_db_path and run_id else None
+    driver = None
+    current_session_count = 0
+    MAX_URLS_PER_DISCOVERY = 15
 
-    logging.info(f"[发现进程] 待展开任务数: {len(expansion_tasks)}")
+    def add_discovered_task(task, max_attempts=URL_RETRY_LIMIT + 1):
+        if not state:
+            raise RuntimeError("StateStore 未初始化，无法写入发现任务")
+        inserted = state.add_task(run_id, task, 'product_info', max_attempts=max_attempts)
+        if inserted and total_increment_queue:
+            total_increment_queue.put(1)
+        return inserted
 
-    # 2. 处理展开任务
-    if expansion_tasks:
-        driver = None
-        current_session_count = 0
-        MAX_URLS_PER_DISCOVERY = 10
+    try:
+        if not state:
+            raise RuntimeError("StateStore 未初始化，发现进程无法运行")
+        state.mark_discovery_started(run_id)
+        total_estimated.value = 0 # 初始归零，配合增量队列使用
+        expansion_tasks = []
 
+        # 1. 快速分类
+        for item in initial_urls:
+            url = item['url']
+            if ('marketplace-see-more-offers' in url and 'product_id' in url) or ('produtos/' in url):
+                task = {'url': url, 'type': 'product_page' if 'produtos/' in url else 'seller_page'}
+                add_discovered_task(task)
+            elif 'seller_id' in url:
+                expansion_tasks.append({'url': url, 'type': 'shop_page', 'pages': item.get('pages_to_scrape')})
+            else:
+                expansion_tasks.append({'url': url, 'type': 'category_page', 'pages': item.get('pages_to_scrape')})
+
+        logging.info(f"[发现进程] 待展开任务数: {len(expansion_tasks)}")
+        if not expansion_tasks:
+            logging.info("--- [发现进程] 无需展开任务 ---")
+            state.mark_discovery_finished(run_id)
+            return
+
+        # 2. 处理展开任务
         for i, task in enumerate(expansion_tasks):
-            # ---------------------------------------------------------
-            # 辅助函数：确保 Driver 可用 (获取 Session 或 复用)
-            # ---------------------------------------------------------
             def ensure_driver_ready():
                 nonlocal driver, current_session_count
                 if driver is None or current_session_count >= MAX_URLS_PER_DISCOVERY:
                     if driver:
                         try: driver.quit()
                         except: pass
-                    
                     driver = None
                     for attempt in range(3):
-                        logging.info(f"[发现进程] 获取会话 (尝试 {attempt+1})...")
+                        logging.info(f"[发现进程] 获取新会话 (尝试 {attempt+1})...")
                         session_data = get_fresh_session(session_queue)
                         if not session_data:
                             time.sleep(5); continue
-                        
                         driver = create_chrome_driver(session_data)
                         if driver: break
-                    
-                    if not driver:
-                        return False
+                    if not driver: return False
                     current_session_count = 0
                 return True
 
-            # ---------------------------------------------------------
-            # 任务执行逻辑
-            # ---------------------------------------------------------
             try:
-                # 1. 准备 Driver
-                if not ensure_driver_ready():
-                    logging.error(f"[发现进程] Driver 初始化失败，跳过任务 {task['url']}")
-                    continue
+                if not ensure_driver_ready(): continue
 
                 url = task['url']
-                task_type = task['type']
-                pages_str = task['pages']
-                
+                # --- 更稳健的页码解析 ---
+                pages_str = str(task['pages']) if task['pages'] else ""
+                if pages_str and pages_str.lower() != 'nan':
+                    try:
+                        pages = [int(p.strip()) for p in pages_str.replace('，', ',').split(',') if p.strip().isdigit()]
+                    except:
+                        pages = range(1, SELLER_SCRAPED_PAGE_COUNT + 1)
+                else:
+                    pages = range(1, SELLER_SCRAPED_PAGE_COUNT + 1)
+
+                # 修正 URL 构建逻辑
                 target_url = url
-                if task_type == 'shop_page':
+                if task['type'] == 'shop_page':
                     seller_id = url.split('seller_id=')[-1]
                     target_url = f"https://www.worten.pt/search?query=*&facetFilters=seller_id:{seller_id}"
 
-                pages = range(1, SELLER_SCRAPED_PAGE_COUNT + 1)
-                if pages_str:
-                    try: pages = [int(p.strip()) for p in pages_str.split(',') if p.strip().isdigit()]
-                    except: pass
-                
-                logging.info(f"[发现进程] 正在展开 ({i+1}/{len(expansion_tasks)}): {target_url} (页数: {len(pages)})")
-                
-                # --- 翻页循环 ---
+                logging.info(f"[发现进程] 正在展开 ({i+1}/{len(expansion_tasks)}): {target_url} (页数: {list(pages)})")
+
                 for page_num in pages:
                     sep = '&' if '?' in target_url else '?'
                     p_url = f"{target_url}{sep}page={page_num}"
-                    
-                    page_success = False
-                    MAX_PAGE_SESSION_RETRIES = 2 # 允许换 2 次 Session 试试
-                    
-                    for retry_idx in range(MAX_PAGE_SESSION_RETRIES + 1):
-                        # 确保有 Driver
-                        if not ensure_driver_ready():
-                            break
 
-                        # 尝试导航
-                        nav_ok = navigate_with_retries(driver, p_url, max_attempts=2)
-                        
-                        if nav_ok:
-                            # 导航成功，跳出重试循环，进行数据抓取
-                            page_success = True
-                            break
-                        else:
-                            # 导航失败
-                            if retry_idx < MAX_PAGE_SESSION_RETRIES:
-                                logging.warning(f"[发现进程] 页 {page_num} 加载失败，销毁当前 Driver，换新 Session 重试...")
-                                if driver:
-                                    try: driver.quit()
-                                    except: pass
-                                driver = None # 强制 ensure_driver_ready 创建新的
-                                current_session_count = 0 # 重置计数
-                            else:
-                                logging.error(f"[发现进程] 页 {page_num} 经过 {MAX_PAGE_SESSION_RETRIES+1} 个 Session 尝试后依然失败，放弃此页。")
+                    # 导航
+                    if not ensure_driver_ready(): break
+                    nav_ok = navigate_with_retries(driver, p_url, max_attempts=2)
 
-                    if not page_success:
-                        logging.warning(f"[发现进程] 放弃店铺 {url} 的后续翻页。")
-                        break
+                    # 即使导航失败也不要直接 break 整个店铺，尝试下一页
+                    if not nav_ok:
+                        logging.warning(f"[发现进程] 页 {page_num} 导航失败，跳过该页。")
+                        fail_task = {'url': p_url, 'type': 'shop_page', 'source_url': url, 'page': page_num}
+                        if add_discovered_task(fail_task, max_attempts=1):
+                            row = product_failure_row(p_url, '列表页导航失败')
+                            state.fail_task(run_id, fail_task['task_key'], 'shop', [row], '列表页导航失败')
+                        continue
 
                     current_session_count += 1
-                    
-                    # 尝试处理弹窗
+
+                    # 处理弹窗
                     try:
                         btn = WebDriverWait(driver, 5).until(EC.element_to_be_clickable((By.CSS_SELECTOR, ".checkYes.button")))
                         driver.execute_script("arguments[0].click();", btn)
                     except: pass
-                    
-                    # 等待列表并提取
-                    found_links = False
+
+                    # 提取链接
+                    found_links = False # 每一页重置
                     try:
                         WebDriverWait(driver, 15).until(EC.presence_of_element_located((By.CSS_SELECTOR, ".listing-content__list li a")))
                         links = driver.find_elements(By.CSS_SELECTOR, ".listing-content__list li a")
-                        
+
                         count = 0
                         for l in links:
                             href = l.get_attribute('href')
                             if href:
-                                full_url = urljoin(BASE_URL, href)
-                                url_queue.put({'url': full_url, 'type': 'product_page'})
-                                count += 1
-                        
-                        # 发送总任务数增量
-                        if count > 0 and total_increment_queue:
-                            total_increment_queue.put(count)
-                            logging.debug(f"[发现进程] 页 {page_num} 总任务增量+{count}")
-                        
-                        if count > 0: found_links = True
-                        logging.info(f"[发现进程] 页 {page_num}: 发现 {count} 个商品")
-                        
+                                child_task = {'url': urljoin(BASE_URL, href), 'type': 'product_page', 'source_url': p_url}
+                                if state.add_task(run_id, child_task, 'product_info', max_attempts=URL_RETRY_LIMIT + 1):
+                                    count += 1
+
+                        if count > 0:
+                            found_links = True
+                            if total_increment_queue:
+                                total_increment_queue.put(count)
+                                logging.info(f"[发现进程] 页 {page_num} 发现 {count} 个任务，已更新总数。")
+
                     except TimeoutException:
-                        logging.warning(f"[发现进程] 页 {page_num} 无结果(超时)。")
-                    
-                    # 如果这一页没有任何商品，通常意味着到了最后一页，停止翻页
+                        logging.warning(f"[发现进程] 页 {page_num} 没找到商品列表，判定为该任务末页。")
+
+                    # 如果这一页确实没货（排除超时情况），则停止该店铺的后续翻页
                     if not found_links:
                         break
-            
+
             except Exception as e:
-                logging.error(f"[发现进程] 任务出错: {e}")
-        
+                logging.error(f"[发现进程] 任务 {task['url']} 发生错误: {e}")
+                continue
+
+        state.mark_discovery_finished(run_id)
+        logging.info("--- [发现进程] 全部完成 ---")
+    except Exception as e:
+        logging.error(f"--- [发现进程] 失败: {e} ---")
+        if state:
+            state.mark_discovery_failed(run_id, str(e))
+        raise
+    finally:
         if driver:
             try: driver.quit()
             except: pass
-
-    logging.info("--- [发现进程] 全部完成 ---")
-    discovery_completed_event.set()
-
-
-def discovery_process_with_progress(initial_urls: List[Dict], url_queue: multiprocessing.Queue,
-                                   session_queue: multiprocessing.Queue, discovery_completed_event, log_queue, total_estimated, total_increment_queue,
-                                   state_db_path=None, run_id=None):
-    """
-    支持进度跟踪的发现进程
-    """
-    # 1. 配置日志
-    setup_log_queue_handler(log_queue)
-    logging.info("--- [发现进程] 启动 ---")
-    state = StateStore(state_db_path) if state_db_path and run_id else None
-    
-    expansion_tasks = []
-    total_estimated.value = 0 # 初始归零，配合增量队列使用
-    
-    # 1. 快速分类
-    for item in initial_urls:
-        url = item['url']
-        if ('marketplace-see-more-offers' in url and 'product_id' in url) or ('produtos/' in url):
-            task = {'url': url, 'type': 'product_page' if 'produtos/' in url else 'seller_page'}
-            if not state or state.add_task(run_id, task, 'product_info', max_attempts=URL_RETRY_LIMIT + 1):
-                url_queue.put(task)
-                if total_increment_queue:
-                    total_increment_queue.put(1) # 直接链接计 1
-        elif 'seller_id' in url:
-            expansion_tasks.append({'url': url, 'type': 'shop_page', 'pages': item.get('pages_to_scrape')})
-        else:
-            expansion_tasks.append({'url': url, 'type': 'category_page', 'pages': item.get('pages_to_scrape')})
-
-    logging.info(f"[发现进程] 待展开任务数: {len(expansion_tasks)}")
-    
-    if not expansion_tasks:
-        logging.info("--- [发现进程] 无需展开任务，通知 Worker 收工 ---")
-        discovery_completed_event.set() 
-        return
-    
-    # 2. 处理展开任务
-    driver = None
-    current_session_count = 0
-    MAX_URLS_PER_DISCOVERY = 15
-
-    for i, task in enumerate(expansion_tasks):
-        def ensure_driver_ready():
-            nonlocal driver, current_session_count
-            if driver is None or current_session_count >= MAX_URLS_PER_DISCOVERY:
-                if driver:
-                    try: driver.quit()
-                    except: pass
-                driver = None
-                for attempt in range(3):
-                    logging.info(f"[发现进程] 获取新会话 (尝试 {attempt+1})...")
-                    session_data = get_fresh_session(session_queue)
-                    if not session_data:
-                        time.sleep(5); continue
-                    driver = create_chrome_driver(session_data)
-                    if driver: break
-                if not driver: return False
-                current_session_count = 0
-            return True
-
-        try:
-            if not ensure_driver_ready(): continue
-
-            url = task['url']
-            # --- 更稳健的页码解析 ---
-            pages_str = str(task['pages']) if task['pages'] else ""
-            if pages_str and pages_str.lower() != 'nan':
-                try:
-                    pages = [int(p.strip()) for p in pages_str.replace('，', ',').split(',') if p.strip().isdigit()]
-                except:
-                    pages = range(1, SELLER_SCRAPED_PAGE_COUNT + 1)
-            else:
-                pages = range(1, SELLER_SCRAPED_PAGE_COUNT + 1)
-
-            # 修正 URL 构建逻辑
-            target_url = url
-            if task['type'] == 'shop_page':
-                seller_id = url.split('seller_id=')[-1]
-                target_url = f"https://www.worten.pt/search?query=*&facetFilters=seller_id:{seller_id}"
-
-            logging.info(f"[发现进程] 正在展开 ({i+1}/{len(expansion_tasks)}): {target_url} (页数: {list(pages)})")
-            
-            for page_num in pages:
-                sep = '&' if '?' in target_url else '?'
-                p_url = f"{target_url}{sep}page={page_num}"
-                
-                # 导航
-                if not ensure_driver_ready(): break
-                nav_ok = navigate_with_retries(driver, p_url, max_attempts=2)
-                
-                # 即使导航失败也不要直接 break 整个店铺，尝试下一页
-                if not nav_ok:
-                    logging.warning(f"[发现进程] 页 {page_num} 导航失败，跳过该页。")
-                    if state:
-                        fail_task = {'url': p_url, 'type': 'shop_page', 'source_url': url, 'page': page_num}
-                        state.add_task(run_id, fail_task, 'product_info', max_attempts=1)
-                        if fail_task.get('task_key'):
-                            row = product_failure_row(p_url, '列表页导航失败')
-                            state.fail_task(run_id, fail_task['task_key'], 'shop', [row], '列表页导航失败')
-                    continue
-
-                current_session_count += 1
-                
-                # 处理弹窗
-                try:
-                    btn = WebDriverWait(driver, 5).until(EC.element_to_be_clickable((By.CSS_SELECTOR, ".checkYes.button")))
-                    driver.execute_script("arguments[0].click();", btn)
-                except: pass
-                
-                # 提取链接
-                found_links = False # 每一页重置
-                try:
-                    WebDriverWait(driver, 15).until(EC.presence_of_element_located((By.CSS_SELECTOR, ".listing-content__list li a")))
-                    links = driver.find_elements(By.CSS_SELECTOR, ".listing-content__list li a")
-                    
-                    count = 0
-                    for l in links:
-                        href = l.get_attribute('href')
-                        if href:
-                            child_task = {'url': urljoin(BASE_URL, href), 'type': 'product_page', 'source_url': p_url}
-                            if not state or state.add_task(run_id, child_task, 'product_info', max_attempts=URL_RETRY_LIMIT + 1):
-                                url_queue.put(child_task)
-                                count += 1
-                    
-                    if count > 0:
-                        found_links = True 
-                        if total_increment_queue:
-                            total_increment_queue.put(count)
-                            logging.info(f"[发现进程] 页 {page_num} 发现 {count} 个任务，已更新总数。")
-                    
-                except TimeoutException:
-                    logging.warning(f"[发现进程] 页 {page_num} 没找到商品列表，判定为该任务末页。")
-                
-                # 如果这一页确实没货（排除超时情况），则停止该店铺的后续翻页
-                if not found_links:
-                    break
-            
-        except Exception as e:
-            logging.error(f"[发现进程] 任务 {task['url']} 发生错误: {e}")
-
-    if driver:
-        try: driver.quit()
-        except: pass
-
-    logging.info("--- [发现进程] 全部完成 ---")
-    discovery_completed_event.set()
+        discovery_completed_event.set()
 
 # --- 抓取 Worker  ---
 
@@ -1028,10 +1063,9 @@ def build_failed_seller_record(url: str, reason: str) -> Dict[str, str]:
 
 
 class ScraperWorker:
-    def __init__(self, url_queue, all_seller_info, all_shop_data, all_product_data,
+    def __init__(self, all_seller_info, all_shop_data, all_product_data,
                  results_lock, session_queue, discovery_completed_event, log_queue=None, increment_queue=None,
-                 state_db_path=None, run_id=None):
-        self.url_queue = url_queue
+                 state_db_path=None, run_id=None, stop_flag=None):
         self.all_seller_info = all_seller_info
         self.all_shop_data = all_shop_data
         self.all_product_data = all_product_data
@@ -1042,6 +1076,7 @@ class ScraperWorker:
         self.increment_queue = increment_queue
         self.state_db_path = state_db_path
         self.run_id = run_id
+        self.stop_flag = stop_flag
         self.state = StateStore(state_db_path) if state_db_path and run_id else None
         
         self.worker_id = str(uuid.uuid4())[:8]
@@ -1083,104 +1118,149 @@ class ScraperWorker:
 
     def run(self):
         setup_log_queue_handler(self.log_queue)
+        if not self.state:
+            logging.error(f"[Worker {self.worker_id}] 状态存储不可用，Worker 退出。")
+            return
 
-        while True:
-            # A. 尝试获取任务
-            try:
-                # 使用较短的超时，以便定期检查退出条件
-                task = self.url_queue.get(block=True, timeout=2)
-            except queue.Empty:
-                # 队列为空
-                if self.discovery_completed_event.is_set():
-                    logging.info(f"[Worker {self.worker_id}] 队列为空且发现已结束，退出。")
+        task_key = None
+        try:
+            while True:
+                if self.stop_flag is not None and self.stop_flag.value:
                     break
-                else:
-                    # 发现还在进行，继续等待
+
+                task = self.state.claim_next_task(self.run_id, self.worker_id)
+                if not task:
+                    if self.state.is_discovery_finished(self.run_id):
+                        logging.info(f"[Worker {self.worker_id}] 发现已结束且无可领取任务，退出。")
+                        break
+                    time.sleep(2)
                     continue
 
-            # B. 拿到任务了 -> 检查是否有 Driver，没有才创建
-            if self.driver is None:
-                if not self.setup_driver():
-                    # 如果创建失败，把任务放回队列
-                    self.url_queue.put(task)
-                    logging.error(f"[Worker {self.worker_id}] 无法创建 Driver，放弃当前任务并退出。")
+                task_key = task.get('task_key')
+                if self.stop_flag is not None and self.stop_flag.value:
+                    if task_key:
+                        self.state.release_task(self.run_id, task_key, self.worker_id, consume_attempt=False, error='任务已停止')
+                    task_key = None
                     break
 
-            # C. 轮换检查
-            if self.processed_count >= self.current_max_urls:
-                logging.info(f"[Worker {self.worker_id}] 轮换 Driver...")
-                self.teardown_driver()
-                if not self.setup_driver():
-                    self.url_queue.put(task) # 把任务放回去
-                    break
+                if self.driver is None:
+                    if not self.setup_driver():
+                        if task_key:
+                            self.state.release_task(self.run_id, task_key, self.worker_id, consume_attempt=False, error='driver_setup_failed')
+                        task_key = None
+                        logging.error(f"[Worker {self.worker_id}] 无法创建 Driver，释放当前任务并退出。")
+                        break
 
-            # D. 执行抓取
-            success = self.process_task(task)
-            
-            if success:
-                self.consecutive_failures = 0
-            else:
-                self.consecutive_failures += 1
-            
-            self.processed_count += 1
-            
-            # E. 中毒检查
-            if self.consecutive_failures >= 3:
-                logging.error(f"[Worker {self.worker_id}] 连续失败3次，强制重启。")
-                self.teardown_driver()
-                # 下次循环的 B 步骤会自动重新创建
-                self.consecutive_failures = 0
+                if self.processed_count >= self.current_max_urls:
+                    logging.info(f"[Worker {self.worker_id}] 轮换 Driver...")
+                    self.teardown_driver()
+                    if not self.setup_driver():
+                        if task_key:
+                            self.state.release_task(self.run_id, task_key, self.worker_id, consume_attempt=False, error='driver_rotation_failed')
+                        task_key = None
+                        break
 
-        self.teardown_driver()
+                success = self.process_task(task)
+                task_key = None
+
+                if success:
+                    self.consecutive_failures = 0
+                else:
+                    self.consecutive_failures += 1
+
+                self.processed_count += 1
+
+                if self.consecutive_failures >= 3:
+                    logging.error(f"[Worker {self.worker_id}] 连续失败3次，强制重启。")
+                    self.teardown_driver()
+                    self.consecutive_failures = 0
+        except Exception as exc:
+            logging.error(f"[Worker {self.worker_id}] Worker 异常退出: {exc}")
+            if task_key:
+                self.state.release_task(self.run_id, task_key, self.worker_id, consume_attempt=False, error=str(exc))
+            raise
+        finally:
+            self.teardown_driver()
+
+    def _append_result_rows(self, result_group, rows):
+        with self.results_lock:
+            target = {
+                'seller': self.all_seller_info,
+                'shop': self.all_shop_data,
+                'product': self.all_product_data,
+            }.get(result_group)
+            if target is None:
+                target = self.all_product_data
+            for row in rows:
+                target.append(row)
+
+    def record_task_result(self, task_key, result_group, rows, status='succeeded', error=None):
+        result_rows = list(rows)
+        if self.state and task_key:
+            saved = self.state.complete_task(
+                self.run_id,
+                task_key,
+                result_group,
+                result_rows,
+                status=status,
+                error=error,
+                owner=self.worker_id,
+            )
+            if not saved:
+                logging.warning(f"[Worker {self.worker_id}] 任务 lease 已失效，丢弃本地结果: {task_key}")
+                return False
+        self._append_result_rows(result_group, result_rows)
+        return True
+
+    def record_task_failure(self, task_key, result_group, rows, error):
+        result_rows = list(rows)
+        if self.state and task_key:
+            saved = self.state.fail_task(
+                self.run_id,
+                task_key,
+                result_group,
+                result_rows,
+                error,
+                owner=self.worker_id,
+            )
+            if not saved:
+                logging.warning(f"[Worker {self.worker_id}] 任务 lease 已失效，丢弃失败结果: {task_key}")
+                return False
+        self._append_result_rows(result_group, result_rows)
+        return True
 
     def process_task(self, task):
         url = task['url']
         ttype = task['type']
         task_key = task.get('task_key')
-        if self.state and not self.state.claim_task(self.run_id, task, self.worker_id):
-            return True
-        
+
         try:
             if ttype == 'seller_page':
                 # from __main__ import scrape_sellers_from_page
                 data = scrape_sellers_from_page(self.driver, url)
                 if data:
-                    with self.results_lock:
-                        self.all_seller_info.extend(data)
-                    if self.state and task_key:
-                        self.state.complete_task(self.run_id, task_key, 'seller', data)
-                    return True
+                    return self.record_task_result(task_key, 'seller', data)
 
                 row = build_failed_seller_record(url, '抓取失败')
-                with self.results_lock:
-                    self.all_seller_info.append(row)
-                if self.state and task_key:
-                    self.state.fail_task(self.run_id, task_key, 'seller', [row], '抓取失败')
+                self.record_task_failure(task_key, 'seller', [row], '抓取失败')
                 return False
-            
+
             elif ttype == 'product_page':
                 # from __main__ import scrape_product_details, scrape_other_sellers_on_product_page, parse_price
-                
+
                 details = scrape_product_details(self.driver, url, proxy_url=self.proxy_for_requests)
                 if not details or details.get('_status') == 'page_load_failed':
                     row = build_failed_product_record(url, '抓取失败')
-                    with self.results_lock:
-                        self.all_product_data.append(row)
-                    if self.state and task_key:
-                        self.state.fail_task(self.run_id, task_key, 'product', [row], '抓取失败')
+                    self.record_task_failure(task_key, 'product', [row], '抓取失败')
                     return False
-                
+
                 if details.get('_status') == 'invalid':
                     row = build_failed_product_record(url, '失效链接')
-                    with self.results_lock:
-                        self.all_product_data.append(row)
-                    if self.state and task_key:
-                        self.state.complete_task(self.run_id, task_key, 'product', [row], status='invalid', error='失效链接')
-                    return True # 视为处理完成（无效链接）
-                
+                    return self.record_task_result(task_key, 'product', [row], status='invalid', error='失效链接') # 视为处理完成（无效链接）
+
                 # 抓取其他卖家
                 others = scrape_other_sellers_on_product_page(self.driver)
-                
+
                 # 计算最低价
                 prices = []
                 p1 = parse_price(details.get("价格"))
@@ -1190,49 +1270,43 @@ class ScraperWorker:
                     if p2: prices.append(p2)
                 if prices:
                     details["当前售价（最低）"] = f"€{min(prices):.2f}"
-                
+
                 # 合并数据
                 final = {'商品链接': url, **details}
                 for i, s in enumerate(others[:3]):
                     final[f'店铺{i+1}'] = s.get('name')
                     final[f'售价{i+1}'] = s.get('price')
                     final[f'运费{i+1}'] = s.get('shipping')
-                
-                with self.results_lock:
-                    self.all_product_data.append(final)
-                if self.state and task_key:
-                    self.state.complete_task(self.run_id, task_key, 'product', [final])
-                logging.info(f" 成功抓取商品: {url}, 剩余队列: {self.url_queue.qsize()}")
-                return True
+
+                saved = self.record_task_result(task_key, 'product', [final])
+                if saved:
+                    logging.info(f" 成功抓取商品: {url}")
+                return saved
 
         except Exception as e:
             logging.error(f"[Worker {self.worker_id}] 任务失败 {url}: {e}")
-            with self.results_lock:
-                if ttype == 'seller_page':
-                    row = build_failed_seller_record(url, '抓取失败')
-                    self.all_seller_info.append(row)
-                    result_group = 'seller'
-                elif ttype == 'product_page':
-                    row = build_failed_product_record(url, '抓取失败')
-                    self.all_product_data.append(row)
-                    result_group = 'product'
-                else:
-                    row = build_failed_product_record(url, '抓取失败')
-                    result_group = 'product'
-            if self.state and task_key:
-                self.state.fail_task(self.run_id, task_key, result_group, [row], str(e))
+            if ttype == 'seller_page':
+                row = build_failed_seller_record(url, '抓取失败')
+                result_group = 'seller'
+            elif ttype == 'product_page':
+                row = build_failed_product_record(url, '抓取失败')
+                result_group = 'product'
+            else:
+                row = build_failed_product_record(url, '抓取失败')
+                result_group = 'product'
+            self.record_task_failure(task_key, result_group, [row], str(e))
             return False
         return False
 
 
 class ScraperWorkerWithProgress(ScraperWorker):
     """支持进度跟踪的Worker类"""
-    def __init__(self, url_queue, all_seller_info, all_shop_data, all_product_data,
+    def __init__(self, all_seller_info, all_shop_data, all_product_data,
                  results_lock, session_queue, discovery_completed_event, log_queue=None, increment_queue=None,
-                 state_db_path=None, run_id=None):
-        super().__init__(url_queue, all_seller_info, all_shop_data, all_product_data,
+                 state_db_path=None, run_id=None, stop_flag=None):
+        super().__init__(all_seller_info, all_shop_data, all_product_data,
                         results_lock, session_queue, discovery_completed_event, log_queue, increment_queue,
-                        state_db_path, run_id)
+                        state_db_path, run_id, stop_flag)
 
     def process_task(self, task):
         # 无论任务成功与否，都应该计入处理总数
@@ -1244,19 +1318,19 @@ class ScraperWorkerWithProgress(ScraperWorker):
         try:
             result = super().process_task(task)
             logging.info(f"[Worker {self.worker_id}] 任务处理结果: {result} - {url}")
+            return result
         except Exception as e:
             logging.error(f"[Worker {self.worker_id}] 任务处理异常: {e} - {url}")
-            result = False
-        
-        # 发送增量信号到进度管理进程
-        if self.increment_queue:
-            try:
-                self.increment_queue.put(1)  # 发送增量1
-                logging.debug(f"[Worker {self.worker_id}] 发送增量信号 (任务: {url})")
-            except Exception as e:
-                logging.error(f"[Worker {self.worker_id}] 发送增量信号失败: {e}")
-                
-        return result
+            raise
+        finally:
+            # 发送增量信号到进度管理进程
+            if self.increment_queue:
+                try:
+                    self.increment_queue.put(1)  # 发送增量1
+                    logging.debug(f"[Worker {self.worker_id}] 发送增量信号 (任务: {url})")
+                except Exception as e:
+                    logging.error(f"[Worker {self.worker_id}] 发送增量信号失败: {e}")
+
 
 def progress_manager(processed_count, total_estimated, increment_queue, total_increment_queue, stop_flag):
     """专门的进度管理进程"""
@@ -1323,7 +1397,29 @@ def main(progress_callback=None, stop_check_callback=None, input_file=None, outp
     run_id, resumed = state.create_or_resume_run('product_info', input_file, output_file)
     if resumed:
         logging.info(f"继续未完成任务: run_id={run_id}, output_file={output_file}")
-    state.recover_stale_tasks(run_id)
+        recovered = state.recover_running_tasks(run_id, '程序重新启动，任务重新排队')
+        if recovered:
+            logging.info(f"已恢复 {recovered} 个上次运行遗留的任务。")
+    else:
+        state.recover_stale_tasks(run_id)
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
 
     # 2. 初始化多进程管理器
     def _log_listener(q: multiprocessing.Queue):
@@ -1351,24 +1447,23 @@ def main(progress_callback=None, stop_check_callback=None, input_file=None, outp
         listener_thread = threading.Thread(target=_log_listener, args=(log_queue,), daemon=True)
         listener_thread.start()
 
-        url_queue = manager.Queue()
         session_queue = manager.Queue()
         stop_flag = manager.Value('b', False)
         discovery_completed_event = manager.Event()
-        
+
         # 数据存储
         all_seller_info = manager.list()
         all_shop_data = manager.list() # 暂时没用到，可根据需求移除
         all_product_data = manager.list()
         results_lock = manager.Lock()
-        
+
         # 进度跟踪 - 使用专门的进度管理进程
         processed_count = manager.Value('i', 0)  # 已处理任务数
         total_estimated = manager.Value('i', 0)  # 总任务数
         increment_queue = manager.Queue()  # 已处理任务增量信号队列
         total_increment_queue = manager.Queue()  # 总任务数增量信号队列
         start_time = manager.Value('d', time.time())
-        
+
         # 启动专门的进度管理进程
         progress_manager_process = multiprocessing.Process(
             target=progress_manager,
@@ -1376,17 +1471,18 @@ def main(progress_callback=None, stop_check_callback=None, input_file=None, outp
         )
         progress_manager_process.start()
         logging.info("[主进程] 进度管理进程已启动")
-        
+
         # 进度更新线程
         def progress_updater():
             """定期更新进度信息"""
             logging.info(f"[进度线程] 启动，初始状态: processed={processed_count.value}, total={total_estimated.value}")
+            last_queue_log = 0
             while not stop_flag.value:
                 try:
                     if progress_callback:
                         elapsed_time = time.time() - start_time.value
                         rate = processed_count.value / (elapsed_time / 60) if elapsed_time > 0 else 0
-                        
+
                         progress = state.progress(run_id)
                         progress_data = {
                             'processed': progress['processed'],
@@ -1394,9 +1490,22 @@ def main(progress_callback=None, stop_check_callback=None, input_file=None, outp
                             'rate': rate,
                             'message': f"已处理 {progress['processed']} 个任务"
                         }
-                        
+
                         logging.info(f"[进度线程] 更新进度: {progress_data}")
                         progress_callback(progress_data)
+
+                    now = time.time()
+                    if now - last_queue_log >= 10:
+                        stats = state.queue_stats(run_id)
+                        discovery = state.discovery_status(run_id)
+                        logging.info(
+                            f"[队列状态] discovery={discovery}, total={stats['total']}, "
+                            f"pending={stats['pending']}, running={stats['running']}, "
+                            f"active_workers={stats['active_workers']}/{MAX_WORKERS}, succeeded={stats['succeeded']}, "
+                            f"failed_final={stats['failed_final']}, invalid={stats['invalid']}"
+                        )
+                        last_queue_log = now
+
                     if stop_check_callback and stop_check_callback():
                         stop_flag.value = True
                     time.sleep(2)  # 每2秒更新一次
@@ -1404,82 +1513,85 @@ def main(progress_callback=None, stop_check_callback=None, input_file=None, outp
                     logging.error(f"进度更新出错: {e}")
                     break
             logging.info("[进度线程] 结束")
-        
+
         progress_thread = threading.Thread(target=progress_updater, daemon=True)
         progress_thread.start()
 
-        for task in state.load_unfinished_tasks(run_id):
-            url_queue.put(task)
-
-        # 3. 启动 Session 生产者
         producers = []
-        for i in range(num_producers):
-            p = multiprocessing.Process(
-                target=session_producer,
-                args=(session_queue, url_queue, stop_flag, cf_port, num_producers, log_queue)
-            )
-            p.start()
-            producers.append(p)
-        
-        logging.info("等待 15 秒以预热 Session...")
-        time.sleep(15)
-
-        # 4. 启动发现进程 (独立的后台进程)
-        logging.info(f"[主进程] 启动发现进程，输入URL数量: {len(initial_urls)}")
-        discovery_p = multiprocessing.Process(
-            target=discovery_process_with_progress,
-            args=(initial_urls, url_queue, session_queue, discovery_completed_event, log_queue, total_estimated, total_increment_queue, state_db_path, run_id)
-        )
-        discovery_p.start()
-        logging.info(f"[主进程] 发现进程已启动，PID: {discovery_p.pid}")
-
-        # 5. 启动抓取 Worker 池 (立即开始，不等发现结束)
-        logging.info(f"启动抓取 Workers... (Worker数量: {MAX_WORKERS})")
-        with ProcessPoolExecutor(max_workers=MAX_WORKERS) as executor:
-            futures = []
-            for i in range(MAX_WORKERS):
-                worker_instance = ScraperWorkerWithProgress(
-                    url_queue, all_seller_info, all_shop_data, all_product_data,
-                    results_lock, session_queue, discovery_completed_event,
-                    log_queue=log_queue, increment_queue=increment_queue,
-                    state_db_path=state_db_path, run_id=run_id
+        discovery_p = None
+        try:
+            # 3. 启动 Session 生产者
+            for i in range(num_producers):
+                p = multiprocessing.Process(
+                    target=session_producer,
+                    args=(session_queue, stop_flag, cf_port, num_producers, log_queue)
                 )
-                logging.info(f"[主进程] 创建 Worker {i+1}/{MAX_WORKERS}: {worker_instance.worker_id}")
-                futures.append(executor.submit(worker_instance.run))
+                p.start()
+                producers.append(p)
 
-            # 等待所有 Worker 完成
-            # Worker 会在 (队列空 AND discovery_completed_event set) 时退出
-            wait(futures)
-            for future in futures:
-                future.result()
-            logging.info("[主进程] 所有 Worker 已完成")
-        
-        logging.info("所有抓取任务完成。")
+            logging.info("等待 15 秒以预热 Session...")
+            time.sleep(15)
 
-        # 通知日志监听器退出并等待其结束
-        try:
-            log_queue.put(None)
-        except Exception:
-            pass
-        try:
-            listener_thread.join(timeout=5)
-        except Exception:
-            pass
+            # 4. 启动发现进程 (独立的后台进程)
+            if state.discovery_status(run_id) == 'finished':
+                logging.info("[主进程] 发现阶段已完成，跳过发现进程。")
+                discovery_completed_event.set()
+            else:
+                logging.info(f"[主进程] 启动发现进程，输入URL数量: {len(initial_urls)}")
+                discovery_p = multiprocessing.Process(
+                    target=discovery_process_with_progress,
+                    args=(initial_urls, session_queue, discovery_completed_event, log_queue, total_estimated, total_increment_queue, state_db_path, run_id)
+                )
+                discovery_p.start()
+                logging.info(f"[主进程] 发现进程已启动，PID: {discovery_p.pid}")
 
-        # 6. 清理
-        stop_flag.value = True
-        discovery_p.join(timeout=5)
-        if discovery_p.is_alive(): discovery_p.terminate()
-        
-        for p in producers:
-            p.join(timeout=5)
-            if p.is_alive(): p.terminate()
-        
-        # 等待进度管理进程结束
-        progress_manager_process.join(timeout=5)
-        if progress_manager_process.is_alive(): progress_manager_process.terminate()
+            # 5. 启动抓取 Worker 池 (立即开始，不等发现结束)
+            logging.info(f"启动抓取 Workers... (Worker数量: {MAX_WORKERS})")
+            with ProcessPoolExecutor(max_workers=MAX_WORKERS) as executor:
+                futures = []
+                for i in range(MAX_WORKERS):
+                    worker_instance = ScraperWorkerWithProgress(
+                        all_seller_info, all_shop_data, all_product_data,
+                        results_lock, session_queue, discovery_completed_event,
+                        log_queue=log_queue, increment_queue=increment_queue,
+                        state_db_path=state_db_path, run_id=run_id, stop_flag=stop_flag
+                    )
+                    logging.info(f"[主进程] 创建 Worker {i+1}/{MAX_WORKERS}: {worker_instance.worker_id}")
+                    futures.append(executor.submit(worker_instance.run))
+
+                wait(futures)
+                for future in futures:
+                    future.result()
+                logging.info("[主进程] 所有 Worker 已完成")
+
+            logging.info("所有抓取任务完成。")
+        finally:
+            stop_flag.value = True
+            try:
+                log_queue.put(None)
+            except Exception:
+                pass
+            if discovery_p is not None:
+                discovery_p.join(timeout=5)
+                if discovery_p.is_alive(): discovery_p.terminate()
+
+            for p in producers:
+                p.join(timeout=5)
+                if p.is_alive(): p.terminate()
+
+            # 等待进度管理进程结束
+            progress_manager_process.join(timeout=5)
+            if progress_manager_process.is_alive(): progress_manager_process.terminate()
+            try:
+                listener_thread.join(timeout=5)
+            except Exception:
+                pass
 
         # 7. 保存
+        if state.discovery_status(run_id) == 'failed':
+            state.set_run_status(run_id, 'failed', '任务发现失败')
+            raise RuntimeError('任务发现失败')
+
         logging.info("正在保存数据...")
         rows_by_group = state.grouped_result_rows(run_id)
         save_data_to_multiple_sheets(
@@ -1493,7 +1605,7 @@ def main(progress_callback=None, stop_check_callback=None, input_file=None, outp
             state.set_run_status(run_id, 'failed', message)
             raise RuntimeError(message)
         state.set_run_status(run_id, 'completed')
-        
+
         # 最终进度更新
         if progress_callback:
             elapsed_time = time.time() - start_time.value

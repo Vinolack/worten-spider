@@ -1,5 +1,6 @@
 import logging
 import multiprocessing
+import os
 import queue
 import random
 import string
@@ -13,6 +14,14 @@ from selenium.common.exceptions import TimeoutException, WebDriverException
 from selenium.webdriver.common.by import By
 from selenium.webdriver.support import expected_conditions as EC
 from selenium.webdriver.support.ui import WebDriverWait
+
+from paths import get_exe_dir
+
+
+def seleniumwire_runtime_dir() -> str:
+    runtime_dir = os.path.join(get_exe_dir(), "runtime", "seleniumwire")
+    os.makedirs(runtime_dir, exist_ok=True)
+    return runtime_dir
 
 
 def get_cf_cookie_from_api(config, port: int, proxy_str: Optional[str] = None) -> Optional[Dict]:
@@ -175,6 +184,10 @@ def create_chrome_driver(
             seleniumwire_options = {
                 'proxy': {'http': proxy_wire, 'https': proxy_wire, 'no_proxy': 'localhost,127.0.0.1'},
                 'verify_ssl': False,
+                'disable_capture': True,
+                'request_storage': 'memory',
+                'request_storage_base_dir': seleniumwire_runtime_dir(),
+                'suppress_connection_errors': True,
             }
             if connection_timeout is not None:
                 seleniumwire_options['connection_timeout'] = connection_timeout
