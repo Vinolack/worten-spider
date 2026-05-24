@@ -18,6 +18,7 @@ from datetime import datetime
 from concurrent.futures import ProcessPoolExecutor, wait, FIRST_COMPLETED
 from typing import List, Dict, Optional, Any, Tuple
 from urllib.parse import unquote, urlsplit, urlunsplit, urljoin
+from curl_cffi import requests as cffi_requests
 
 # Selenium
 import seleniumwire.undetected_chromedriver as uc
@@ -295,13 +296,15 @@ def _request_image(
                 'timeout': timeout,
                 'proxies': proxies,
                 'verify': verify,
+                'impersonate': 'chrome110'
             }
             if verify is False:
                 with warnings.catch_warnings():
                     warnings.simplefilter('ignore', InsecureRequestWarning)
-                    response = requests.get(url, **kwargs)
+                    response = cffi_requests.get(url, **kwargs)
             else:
-                response = requests.get(url, **kwargs)
+                response = cffi_requests.get(url, **kwargs)
+            
             response.raise_for_status()
             content = response.content
             content_type = response.headers.get('Content-Type', '')
@@ -417,7 +420,7 @@ def upload_to_image_host(image_content: bytes, filename: str, source_url: str = 
                     parts = list(urlsplit(original_url))
                     parts[1] = "gbcm-imagehost.vshare.dev" # 替换域名
                     return urlunsplit(parts)
-
+                logging.error(f"图床真实返回的 JSON 为: {payload}")
                 logging.error(f"[Retry {attempt+1}] 上传响应缺少url字段，不重试: {response.status_code}, product_url={product_url}, filename={filename}, content_type={content_type or 'unknown'}, source_url={source_url}, body={_response_preview(response)}")
                 break
             else:
