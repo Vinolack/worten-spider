@@ -11,6 +11,11 @@ from io import BytesIO
 from logging.handlers import QueueHandler
 import requests
 import pandas as pd
+try:
+    from PIL import Image
+    import pillow_avif  # Registers AVIF support for Pillow.
+except ImportError:
+    Image = None
 from urllib3.exceptions import InsecureRequestWarning
 import multiprocessing
 import subprocess
@@ -167,7 +172,9 @@ def navigate_with_retries(driver: uc.Chrome, url: str, max_attempts: int = 3, ba
     return browser_runtime.navigate_with_retries(driver, url, max_attempts, backoff_base)
        
 # ---  Image Download and Upload Functions ---
-IMAGE_DOWNLOAD_FAILED = "fail"
+IMAGE_DOWNLOAD_FAILED = "download fail"
+IMAGE_TRANSFER_FAILED = "transfer fail"
+IMAGE_UPLOAD_FAILED = "upload fail"
 IMAGE_SOURCE_INVALID = "图片源文件失效"
 
 
@@ -208,6 +215,41 @@ def _image_extension_from_content(content: bytes, content_type: str, fallback_ur
 
 def _filename_for_image(content: bytes, content_type: str, fallback_url: str) -> str:
     return f"{uuid.uuid4()}{_image_extension_from_content(content, content_type, fallback_url)}"
+
+
+def _is_avif_image(content: bytes, content_type: str) -> bool:
+    content_type = (content_type or '').split(';', 1)[0].strip().lower()
+    return content_type == 'image/avif' or content.startswith((
+        b'\x00\x00\x00\x18ftypavif',
+        b'\x00\x00\x00\x1cftypavif',
+    ))
+
+
+def convert_avif_to_jpg(image_content: bytes, content_type: str, source_url: str, product_url: str = '') -> Optional[Tuple[bytes, str, str]]:
+    if not _is_avif_image(image_content, content_type):
+        return image_content, _filename_for_image(image_content, content_type, source_url), content_type
+    if Image is None:
+        logging.error(f"AVIF转JPG失败: Pillow/pillow-avif-plugin 未安装, product_url={product_url}, source_url={source_url}")
+        return None
+
+    try:
+        with Image.open(BytesIO(image_content)) as image:
+            if image.mode in ('RGBA', 'LA') or (image.mode == 'P' and 'transparency' in image.info):
+                rgba_image = image.convert('RGBA')
+                background = Image.new('RGB', rgba_image.size, (255, 255, 255))
+                background.paste(rgba_image, mask=rgba_image.split()[-1])
+                image = background
+            else:
+                image = image.convert('RGB')
+
+            output = BytesIO()
+            image.save(output, format='JPEG', quality=90, optimize=True)
+            filename = f"{uuid.uuid4()}.jpg"
+            logging.info(f"AVIF图片已转为JPG: product_url={product_url}, source_url={source_url}, filename={filename}")
+            return output.getvalue(), filename, 'image/jpeg'
+    except Exception as e:
+        logging.error(f"AVIF转JPG失败: product_url={product_url}, source_url={source_url}, error={e}")
+        return None
 
 
 def _strip_image_size_suffix(url: str) -> str:
@@ -391,6 +433,21 @@ def _extract_uploaded_url(payload: Any) -> Optional[str]:
     return None
 
 
+def _extract_upload_failure_message(payload: Any) -> Optional[str]:
+    if not isinstance(payload, dict):
+        return None
+    message = payload.get('message')
+    if isinstance(message, str) and message.strip():
+        return message.strip()
+
+    data = payload.get('data')
+    if isinstance(data, dict):
+        data_message = data.get('message')
+        if isinstance(data_message, str) and data_message.strip():
+            return data_message.strip()
+    return None
+
+
 def _response_preview(response: requests.Response, limit: int = 500) -> str:
     try:
         return response.text[:limit].replace('\n', ' ').replace('\r', ' ')
@@ -398,42 +455,39 @@ def _response_preview(response: requests.Response, limit: int = 500) -> str:
         return '<response text unavailable>'
 
 
-def upload_to_image_host(image_content: bytes, filename: str, source_url: str = '', content_type: str = '', product_url: str = '') -> Optional[str]:
-    for attempt in range(MAX_RETRIES):
-        try:
-            image_file = BytesIO(image_content)
-            response = requests.post(
-                IMAGE_HOST_UPLOAD_URL,
-                files={'image': (filename, image_file)},
-                data={'token': IMAGE_TOKEN},
-                timeout=10 * (attempt + 1)
-            )
-            if response.ok:
-                try:
-                    payload = response.json()
-                except ValueError:
-                    logging.error(f"[Retry {attempt+1}] 上传返回非JSON: {response.status_code}, product_url={product_url}, filename={filename}, content_type={content_type or 'unknown'}, source_url={source_url}, body={_response_preview(response)}")
-                    payload = None
+def upload_to_image_host(image_content: bytes, filename: str, source_url: str = '', content_type: str = '', product_url: str = '') -> Tuple[Optional[str], Optional[str]]:
+    last_failure_reason = None
+    # for attempt in range(MAX_RETRIES):
+    try:
+        image_file = BytesIO(image_content)
+        response = requests.post(
+            IMAGE_HOST_UPLOAD_URL,
+            files={'image': (filename, image_file)},
+            data={'token': IMAGE_TOKEN},
+            timeout=10
+        )
+        if response.ok:
+            try:
+                payload = response.json()
+            except ValueError:
+                logging.error(f"上传返回非JSON: {response.status_code}, product_url={product_url}, filename={filename}, content_type={content_type or 'unknown'}, source_url={source_url}, body={_response_preview(response)}")
+                payload = None
 
-                original_url = _extract_uploaded_url(payload)
-                if original_url:
-                    parts = list(urlsplit(original_url))
-                    parts[1] = "gbcm-imagehost.vshare.dev" # 替换域名
-                    return urlunsplit(parts)
-                logging.error(f"图床真实返回的 JSON 为: {payload}")
-                logging.error(f"[Retry {attempt+1}] 上传响应缺少url字段，不重试: {response.status_code}, product_url={product_url}, filename={filename}, content_type={content_type or 'unknown'}, source_url={source_url}, body={_response_preview(response)}")
-                break
-            else:
-                logging.error(f"[Retry {attempt+1}] 上传失败 HTTP {response.status_code}, product_url={product_url}, filename={filename}, content_type={content_type or 'unknown'}, source_url={source_url}, body={_response_preview(response)}")
-                if response.status_code < 500 and response.status_code != 429:
-                    break
-        except Exception as e:
-            logging.error(f"[Retry {attempt+1}] 上传异常: product_url={product_url}, filename={filename}, content_type={content_type or 'unknown'}, source_url={source_url}, error={str(e)}")
-            if not _is_retryable_network_error(e):
-                break
-        if attempt < MAX_RETRIES - 1:
-            time.sleep(2 ** (attempt + 1))
-    return None
+            original_url = _extract_uploaded_url(payload)
+            if original_url:
+                parts = list(urlsplit(original_url))
+                parts[1] = "gbcm-imagehost.vshare.dev" # 替换域名
+                return urlunsplit(parts), None
+            last_failure_reason = _extract_upload_failure_message(payload) or last_failure_reason
+
+            logging.error(f"上传响应缺少url字段: {response.status_code}, failure_reason={last_failure_reason or IMAGE_UPLOAD_FAILED}, product_url={product_url}, filename={filename}, content_type={content_type or 'unknown'}, source_url={source_url}, body={_response_preview(response)}")
+        else:
+            logging.error(f"上传失败 HTTP {response.status_code}, product_url={product_url}, filename={filename}, content_type={content_type or 'unknown'}, source_url={source_url}, body={_response_preview(response)}")
+    except Exception as e:
+        logging.error(f"上传异常: product_url={product_url}, filename={filename}, content_type={content_type or 'unknown'}, source_url={source_url}, error={str(e)}")
+        # if attempt < MAX_RETRIES - 1:
+        #     time.sleep(2 ** (attempt + 1))
+    return None, last_failure_reason or IMAGE_UPLOAD_FAILED
 
 def scrape_sellers_from_page(driver: uc.Chrome, product_url: str) -> List[Dict]:
     """
@@ -614,12 +668,19 @@ def scrape_product_details(driver: uc.Chrome, product_url: str, proxy_url: Optio
                 continue
 
             filename = filename_or_failure
-            uploaded_url = upload_to_image_host(image_content, filename, source_url=url, content_type=content_type, product_url=product_url)
+            converted_image = convert_avif_to_jpg(image_content, content_type, url, product_url=product_url)
+            if converted_image is None:
+                details[image_key] = IMAGE_TRANSFER_FAILED
+                logging.warning(f"图片转换失败，已标记为 {IMAGE_TRANSFER_FAILED}: product_url={product_url}, raw_src={raw_src}, normalized_url={url}, filename={filename}, content_type={content_type or 'unknown'}")
+                continue
+
+            image_content, filename, content_type = converted_image
+            uploaded_url, upload_failure_reason = upload_to_image_host(image_content, filename, source_url=url, content_type=content_type, product_url=product_url)
             if uploaded_url:
                 details[image_key] = uploaded_url
             else:
-                details[image_key] = "fail"
-                logging.warning(f"图片上传失败，已标记为 fail: product_url={product_url}, raw_src={raw_src}, normalized_url={url}, filename={filename}, content_type={content_type or 'unknown'}")
+                details[image_key] = upload_failure_reason or IMAGE_UPLOAD_FAILED
+                logging.warning(f"图片上传失败，已标记为 {details[image_key]}: product_url={product_url}, raw_src={raw_src}, normalized_url={url}, filename={filename}, content_type={content_type or 'unknown'}")
 
         # 5. Price, Seller, Shipping
         try: details["价格"] = driver.find_element(By.CSS_SELECTOR, "span[class='price--lg price--mixed price--B price'] span[class='price__numbers--bold price__numbers notranslate raised-decimal price__numbers--bold price__numbers']").text.strip()
