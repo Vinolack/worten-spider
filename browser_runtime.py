@@ -1,7 +1,6 @@
 import logging
 import multiprocessing
 import os
-import queue
 import random
 import string
 import time
@@ -56,7 +55,7 @@ def get_cf_cookie_from_api(config, port: int, proxy_str: Optional[str] = None) -
         return None
 
 
-def close_cookie_pup(driver: uc.Chrome) -> bool:
+def close_cookie_pup(driver) -> bool:
     try:
         cookie_pup_selector = "button[class='button--md button--primary button--black button'] span"
         cookie_close_bth = WebDriverWait(driver, 10).until(
@@ -115,8 +114,51 @@ def force_kill_driver(driver) -> None:
         except Exception as exc:
             logging.warning(f"强制清理进程 {pid} 失败: {exc}")
 
+    # Fallback: 清理当前进程树下残留的 Chrome/ChromeDriver 子进程
+    try:
+        current_pid = os.getpid()
+        parent = psutil.Process(current_pid)
+        for child in parent.children(recursive=True):
+            try:
+                if child.name() and child.name().lower() in ('chrome.exe', 'chromedriver.exe'):
+                    logging.debug(f"清理残留 Chrome 子进程: PID={child.pid}, name={child.name()}")
+                    child.kill()
+            except (psutil.NoSuchProcess, psutil.AccessDenied):
+                pass
+    except Exception:
+        pass
 
-def navigate_with_retries(driver: uc.Chrome, url: str, max_attempts: int = 3, backoff_base: int = 2) -> bool:
+
+def clear_driver_requests(driver) -> None:
+    """
+    清理 Selenium Wire 的请求缓存，防止内存持续增长。
+    
+    Selenium Wire 即使设置了 disable_capture=True，其内部的 mitmproxy 代理
+    仍然会在 Python 堆上累积 Flow 对象和请求/响应数据。此方法通过清除
+    driver.requests 列表和调用内部清理方法来释放已累积的内存。
+    
+    应在每个任务处理完后调用。
+    """
+    if not driver:
+        return
+    try:
+        # 清除已捕获的请求列表引用
+        if hasattr(driver, 'requests'):
+            driver.requests.clear()
+        # 触发 Selenium Wire 内部的存储清理
+        if hasattr(driver, '_storage'):
+            try:
+                driver._storage.clear()
+            except Exception:
+                pass
+        # 清除请求历史
+        if hasattr(driver, 'request_history'):
+            driver.request_history.clear()
+    except Exception:
+        pass
+
+
+def navigate_with_retries(driver, url: str, max_attempts: int = 3, backoff_base: int = 2) -> bool:
     for attempt in range(1, max_attempts + 1):
         try:
             driver.get(url)
@@ -168,6 +210,16 @@ def create_chrome_driver(
     sleep_after_base_get: bool = False,
     sleep_before_return: bool = False,
 ) -> Optional[uc.Chrome]:
+    """
+    创建 Chrome Driver，使用 Selenium Wire 代理处理认证。
+    
+    内存控制策略：
+    1. disable_capture=True: 不存储请求/响应到 driver.requests
+    2. request_storage='memory': 使用内存存储（而非磁盘）
+    3. suppress_connection_errors=True: 不记录连接错误
+    4. 每个任务处理完后调用 clear_driver_requests() 清理缓存
+    5. 缩短 Driver 轮换间隔：处理少量 URL 后即重建 Driver，释放累积内存
+    """
     if not session_data:
         return None
     wait_for_safe_cpu(threshold=80.0, check_interval=random.randint(3, 5))
@@ -254,21 +306,6 @@ def create_chrome_driver(
     if driver:
         force_kill_driver(driver)
     return None
-
-
-def get_fresh_session(session_queue, session_lifespan_seconds: int, min_session_usable_time_seconds: int):
-    while True:
-        try:
-            session_data = session_queue.get(timeout=60)
-        except queue.Empty:
-            return None
-
-        created_at = session_data.get('created_at', 0)
-        age = time.time() - created_at
-        max_age = session_lifespan_seconds - min_session_usable_time_seconds
-        if age < max_age:
-            return session_data
-        logging.info(f"丢弃过期会话 (Age: {int(age)}s)")
 
 
 def create_session_data(config, port: int) -> Optional[Dict]:

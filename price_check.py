@@ -66,13 +66,11 @@ OUTPUT_FILE = os.path.join(exe_folder, f"worten_price_data_{timestamp}.xlsx")
 
 MAX_RETRIES = 3
 URL_RETRY_LIMIT = 5
+CF_BYPASS_PORT = int(c.get_key('cf_bypass_port') or 3000)
 MAX_WORKERS = int(c.get_key('MAX_WORKER') or 4)
 DEFAULT_MAX_URLS_PER_DRIVER_MIN = 15
 DEFAULT_MAX_URLS_PER_DRIVER_MAX = 20
-SESSION_LIFESPAN_SECONDS = 10 * 60
-MIN_SESSION_USABLE_TIME_SECONDS = 4 * 60
 
-CHROME_INIT_LOCK = multiprocessing.Lock()
 logging.basicConfig(level=LOG_LEVEL, format='%(asctime)s - %(levelname)s - [Process %(process)d] - %(message)s')
 logging.getLogger('seleniumwire').setLevel(logging.WARNING)
 
@@ -137,36 +135,27 @@ def force_kill_driver(driver):
 def navigate_with_retries(driver: uc.Chrome, url: str, max_attempts: int = 3, backoff_base: int = 2) -> bool:
     return browser_runtime.navigate_with_retries(driver, url, max_attempts, backoff_base)
 
-def create_chrome_driver(session_data: Dict) -> Optional[uc.Chrome]:
+def create_chrome_driver(session_data: Dict, chrome_init_lock=None) -> Optional[uc.Chrome]:
+    lock = chrome_init_lock or multiprocessing.Lock()
     return browser_runtime.create_chrome_driver(
         session_data,
         CHROME_FOR_TESTING_PATH,
         DRIVER_FOR_TESTING_PATH,
         BASE_URL,
-        CHROME_INIT_LOCK,
+        lock,
         max_retries=MAX_RETRIES,
         connection_timeout=20,
         sleep_after_base_get=True,
     )
 
-# --- 会话生产 ---
+# --- 会话管理 ---
 
-def session_producer(session_queue, stop_flag, port, num_producers, log_queue):
-    setup_log_queue_handler(log_queue)
-    shutdown_buffer = num_producers if num_producers > 1 else 2
-    while not stop_flag.value:
-        try:
-            if session_queue.qsize() < int(MAX_WORKERS / 2 + shutdown_buffer):
-                session_data = browser_runtime.create_session_data(c, port)
-                if session_data and "cookies" in session_data:
-                    session_queue.put(session_data)
-                    logging.info(f"[生产者{port}] 会话就绪。库存: {session_queue.qsize()}")
-                time.sleep(2)
-            else: time.sleep(2)
-        except: time.sleep(10)
-
-def get_fresh_session(session_queue):
-    return browser_runtime.get_fresh_session(session_queue, SESSION_LIFESPAN_SECONDS, MIN_SESSION_USABLE_TIME_SECONDS)
+def get_fresh_session(session_lock=None):
+    """按需请求一个新会话。session_lock 用于跨进程序列化 cf_bypass API 调用。"""
+    if session_lock:
+        with session_lock:
+            return browser_runtime.create_session_data(c, CF_BYPASS_PORT)
+    return browser_runtime.create_session_data(c, CF_BYPASS_PORT)
 
 # --- 任务发现 ---
 
@@ -182,7 +171,7 @@ def parse_pages_to_scrape(pages_value):
     return parse_pages_to_scrape_shared(pages_value, SELLER_SCRAPED_PAGE_COUNT)
 
 
-def discovery_process_with_progress(initial_urls, session_queue, discovery_completed_event, log_queue, total_estimated, total_increment_queue, all_product_data, results_lock, state_db_path=None, run_id=None):
+def discovery_process_with_progress(initial_urls, discovery_completed_event, log_queue, total_estimated, total_increment_queue, all_product_data, results_lock, state_db_path=None, run_id=None):
     setup_log_queue_handler(log_queue)
     logging.info("--- [发现进程] 启动 ---")
     total_estimated.value = 0
@@ -345,10 +334,7 @@ def scrape_listing_page_prices(driver: uc.Chrome, listing_url: str) -> Optional[
 # --- Worker  ---
 
 class ScraperWorker:
-    def __init__(self, all_product_data, results_lock, session_queue, discovery_completed_event, log_queue=None, increment_queue=None, state_db_path=None, run_id=None, stop_flag=None):
-        self.all_product_data = all_product_data
-        self.results_lock = results_lock
-        self.session_queue = session_queue
+    def __init__(self, discovery_completed_event, log_queue=None, increment_queue=None, state_db_path=None, run_id=None, stop_flag=None, session_lock=None, chrome_init_lock=None):
         self.discovery_completed_event = discovery_completed_event
         self.log_queue = log_queue
         self.increment_queue = increment_queue
@@ -361,22 +347,24 @@ class ScraperWorker:
         self.processed_count = 0
         self.consecutive_failures = 0
         self.current_max_urls = random.randint(DEFAULT_MAX_URLS_PER_DRIVER_MIN, DEFAULT_MAX_URLS_PER_DRIVER_MAX)
+        self.session_lock = session_lock
+        self.chrome_init_lock = chrome_init_lock
 
     def setup_driver(self):
         for i in range(MAX_RETRIES):
-            session = get_fresh_session(self.session_queue)
+            session = get_fresh_session(self.session_lock)
             if not session:
-                time.sleep(2)
+                time.sleep(5 * (i + 1))  # 指数退避
                 continue
             
-            self.driver = create_chrome_driver(session)
+            self.driver = create_chrome_driver(session, self.chrome_init_lock)
             if self.driver:
                 self.processed_count = 0
                 return True
             else:
                 logging.warning(f"[Worker {self.worker_id}] 会话不可用，重试...")
         
-        logging.error(f"[Worker {self.worker_id}] 连续启动失败，Worker 退出。")
+        logging.error(f"[Worker {self.worker_id}] 连续启动失败，Worker 将稍后继续尝试。")
         return False
 
     def teardown_driver(self):
@@ -389,6 +377,11 @@ class ScraperWorker:
         if not self.state:
             logging.error(f"[Worker {self.worker_id}] 状态存储不可用，Worker 退出。")
             return
+
+        # 错开启动：避免所有 Worker 同时请求 Session 和创建 Driver
+        startup_delay = random.uniform(1, max(3, MAX_WORKERS))
+        logging.info(f"[Worker {self.worker_id}] 启动，延迟 {startup_delay:.1f}s 后开始...")
+        time.sleep(startup_delay)
 
         task_key = None
         try:
@@ -415,7 +408,9 @@ class ScraperWorker:
                         if task_key:
                             self.state.release_task(self.run_id, task_key, self.worker_id, consume_attempt=False, error='driver_setup_failed')
                         task_key = None
-                        break
+                        logging.error(f"[Worker {self.worker_id}] 无法创建 Driver，释放当前任务并暂停后继续。")
+                        time.sleep(10)
+                        continue
 
                 if self.processed_count >= self.current_max_urls:
                     logging.info(f"[Worker {self.worker_id}] 轮换 Driver...")
@@ -424,13 +419,23 @@ class ScraperWorker:
                         if task_key:
                             self.state.release_task(self.run_id, task_key, self.worker_id, consume_attempt=False, error='driver_rotation_failed')
                         task_key = None
-                        break
+                        logging.error(f"[Worker {self.worker_id}] 轮换 Driver 失败，释放当前任务并暂停后继续。")
+                        time.sleep(10)
+                        continue
 
                 # 处理任务并发送进度信号
                 success = self.process_task(task)
                 task_key = None
                 if self.increment_queue:
                     self.increment_queue.put(1) # 进度+1
+
+                # 释放 Chrome 内存：清除 cookies 和请求缓存
+                if self.driver:
+                    try:
+                        self.driver.delete_all_cookies()
+                    except Exception:
+                        pass
+                    browser_runtime.clear_driver_requests(self.driver)
 
                 if success: self.consecutive_failures = 0
                 else: self.consecutive_failures += 1
@@ -462,9 +467,6 @@ class ScraperWorker:
             if not saved:
                 logging.warning(f"[Worker {self.worker_id}] 任务 lease 已失效，丢弃本地结果: {task_key}")
                 return False
-        with self.results_lock:
-            for row in result_rows:
-                self.all_product_data.append(row)
         return True
 
     def record_task_failure(self, task_key, result_group, rows, error):
@@ -481,9 +483,6 @@ class ScraperWorker:
             if not saved:
                 logging.warning(f"[Worker {self.worker_id}] 任务 lease 已失效，丢弃失败结果: {task_key}")
                 return False
-        with self.results_lock:
-            for row in result_rows:
-                self.all_product_data.append(row)
         return True
 
     def process_task(self, task):
@@ -572,8 +571,6 @@ def progress_manager(processed_count, total_estimated, increment_queue, total_in
 def main(progress_callback=None, stop_check_callback=None, input_file=None, output_file=None, state_db_path=None):
     multiprocessing.freeze_support()
     os.environ["WDM_DEFAULT_TIMEOUT"] = "90"
-    cf_port = int(c.get_key('cf_bypass_port') or 3000)
-    num_producers = int(c.get_key('num_session_producers') or 1)
     input_file = input_file or INPUT_FILE
     output_file = output_file or OUTPUT_FILE
     state_db_path = state_db_path or default_state_db()
@@ -607,12 +604,14 @@ def main(progress_callback=None, stop_check_callback=None, input_file=None, outp
         listener_thread = threading.Thread(target=_log_listener, args=(log_queue,), daemon=True)
         listener_thread.start()
 
-        session_queue = manager.Queue()
         stop_flag = manager.Value('b', False)
         discovery_completed_event = manager.Event()
+
+        # 跨进程序列化锁：防止所有 Worker 同时请求 Session 和创建 Chrome
+        session_lock = manager.Lock()
+        chrome_init_lock = manager.Lock()
         
-        all_product_data = manager.list()
-        results_lock = manager.Lock()
+        # 数据存储 — 结果直接存入 SQLite，不再需要 manager.list 累积内存
 
         # 进度管理变量
         processed_count = manager.Value('i', 0)
@@ -660,18 +659,15 @@ def main(progress_callback=None, stop_check_callback=None, input_file=None, outp
         updater_t.start()
 
         # 启动组件
-        producers = []
         discovery_p = None
         try:
-            producers = [multiprocessing.Process(target=session_producer, args=(session_queue, stop_flag, cf_port, num_producers, log_queue)) for _ in range(num_producers)]
-            for p in producers: p.start()
-            time.sleep(10)
+            logging.info("按需请求 Session：跳过备用 Session 生产和预热。")
 
-            discovery_p = multiprocessing.Process(target=discovery_process_with_progress, args=(initial_urls, session_queue, discovery_completed_event, log_queue, total_estimated, total_increment_queue, all_product_data, results_lock, state_db_path, run_id))
+            discovery_p = multiprocessing.Process(target=discovery_process_with_progress, args=(initial_urls, discovery_completed_event, log_queue, total_estimated, total_increment_queue, all_product_data, results_lock, state_db_path, run_id))
             discovery_p.start()
 
             with ProcessPoolExecutor(max_workers=MAX_WORKERS) as executor:
-                futures = [executor.submit(ScraperWorker(all_product_data, results_lock, session_queue, discovery_completed_event, log_queue, increment_queue, state_db_path, run_id, stop_flag).run) for _ in range(MAX_WORKERS)]
+                futures = [executor.submit(ScraperWorker(discovery_completed_event, log_queue, increment_queue, state_db_path, run_id, stop_flag, session_lock, chrome_init_lock).run) for _ in range(MAX_WORKERS)]
                 wait(futures)
                 for future in futures:
                     future.result()
@@ -685,10 +681,6 @@ def main(progress_callback=None, stop_check_callback=None, input_file=None, outp
                 discovery_p.join(timeout=5)
                 if discovery_p.is_alive():
                     discovery_p.terminate()
-            for p in producers:
-                p.join(timeout=5)
-                if p.is_alive():
-                    p.terminate()
             pm_p.join(timeout=5)
             if pm_p.is_alive():
                 pm_p.terminate()
@@ -697,7 +689,7 @@ def main(progress_callback=None, stop_check_callback=None, input_file=None, outp
             state.set_run_status(run_id, 'failed', '任务发现失败')
             raise RuntimeError('任务发现失败')
         rows_by_group = state.grouped_result_rows(run_id)
-        save_data_to_excel(rows_by_group.get('price', list(all_product_data)), output_file)
+        save_data_to_excel(rows_by_group.get('price', []), output_file)
         if state.has_incomplete_tasks(run_id):
             message = '仍有未完成任务，稍后可再次点击开始/继续任务'
             state.set_run_status(run_id, 'failed', message)
