@@ -9,11 +9,15 @@ PRODUCT_COLUMNS = [
 
 SELLER_COLUMNS = ['初始链接', '店铺名称', '链接', '店铺运费', '送货时间']
 PRICE_COLUMNS = ['商品链接', '价格', '运费', '销售和发货方']
+PRODUCT_LINK_COLUMNS = ['商品链接']
+PRODUCT_IMAGE_COLUMNS = ['商品链接', '图1', '图2', '图3', '图4', '图5']
 
 PRODUCT_SHEET = '商品链接数据 (Product Links)'
 SHOP_SHEET = '店铺链接数据 (Shop Products)'
 SELLER_SHEET = '跟卖链接数据 (Sellers)'
 PRICE_SHEET = '商品价格数据 (Product Prices)'
+PRODUCT_LINK_SHEET = '商品链接列表 (Product Links)'
+PRODUCT_IMAGE_SHEET = '商品图片数据 (Product Images)'
 
 
 def filter_row(row: Dict[str, Any], columns: Iterable[str]) -> Dict[str, Any]:

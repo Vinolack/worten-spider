@@ -6,6 +6,7 @@ import logging
 import multiprocessing
 import os
 import queue
+import subprocess
 import sys
 import threading
 import time
@@ -16,7 +17,9 @@ from tkinter import filedialog, messagebox, ttk
 import configloader
 import more_seller
 import price_check
+import product_images
 import product_info
+import product_links
 from state_store import default_state_db
 
 GUI_CONFIG = configloader.config()
@@ -29,6 +32,18 @@ MODES = {
         "module": product_info,
         "output_prefix": "worten_data",
         "help": "功能说明：抓取商品基础信息，适合处理商品页、店铺页、类目页或列表页。\n输入说明：input_links.xlsx 必须包含 url 列；如 url 是店铺/类目/列表链接，可选填 pages_to_scrape 指定抓取页数。",
+    },
+    "product_links": {
+        "label": "商品链接提取",
+        "module": product_links,
+        "output_prefix": "worten_product_links",
+        "help": "功能说明：从店铺页、卖家页、类目页或列表页提取商品链接，只输出商品链接，不抓取商品详情。\n输入说明：input_links.xlsx 必须包含 url 列；可选填 pages_to_scrape 指定抓取页数。",
+    },
+    "product_images": {
+        "label": "商品图片处理",
+        "module": product_images,
+        "output_prefix": "worten_product_images",
+        "help": "功能说明：仅处理商品页图库图片，输出商品链接和处理后的图1至图5图片链接，不抓取价格、卖家或商品详情。\n输入说明：input_links.xlsx 必须包含 url 列；url 应填写商品链接，可使用 /produtos/... 相对链接。",
     },
     "price_check": {
         "label": "价格检查",
@@ -180,9 +195,9 @@ class WortenScraperGUI:
             if os.name == "nt":
                 os.startfile(filename)
             elif sys.platform == "darwin":
-                os.system(f'open "{filename}"')
+                subprocess.run(["open", filename], check=False)
             else:
-                os.system(f'xdg-open "{filename}"')
+                subprocess.run(["xdg-open", filename], check=False)
         except Exception as exc:
             messagebox.showerror("错误", f"无法打开文件: {exc}")
 

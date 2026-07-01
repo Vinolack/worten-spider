@@ -171,7 +171,7 @@ def parse_pages_to_scrape(pages_value):
     return parse_pages_to_scrape_shared(pages_value, SELLER_SCRAPED_PAGE_COUNT)
 
 
-def discovery_process_with_progress(initial_urls, discovery_completed_event, log_queue, total_estimated, total_increment_queue, all_product_data, results_lock, state_db_path=None, run_id=None):
+def discovery_process_with_progress(initial_urls, discovery_completed_event, log_queue, total_estimated, total_increment_queue, state_db_path=None, run_id=None):
     setup_log_queue_handler(log_queue)
     logging.info("--- [发现进程] 启动 ---")
     total_estimated.value = 0
@@ -663,7 +663,7 @@ def main(progress_callback=None, stop_check_callback=None, input_file=None, outp
         try:
             logging.info("按需请求 Session：跳过备用 Session 生产和预热。")
 
-            discovery_p = multiprocessing.Process(target=discovery_process_with_progress, args=(initial_urls, discovery_completed_event, log_queue, total_estimated, total_increment_queue, all_product_data, results_lock, state_db_path, run_id))
+            discovery_p = multiprocessing.Process(target=discovery_process_with_progress, args=(initial_urls, discovery_completed_event, log_queue, total_estimated, total_increment_queue, state_db_path, run_id))
             discovery_p.start()
 
             with ProcessPoolExecutor(max_workers=MAX_WORKERS) as executor:

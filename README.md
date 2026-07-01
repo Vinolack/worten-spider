@@ -23,7 +23,7 @@ cft/
 
 **3. 填写 config.toml**
 
-三个功能共用同一个 `config.toml`：
+五个功能共用同一个 `config.toml`：
 
 * `SELLER_SCRAPED_PAGE_COUNT`：店铺/类目链接默认爬取页数
 * `IMAGE_HOST_UPLOAD_URL`：图床地址
@@ -49,7 +49,7 @@ pip install -r .\requirements.txt
 python .\worten_gui.py
 ```
 
-GUI 顶部通过功能选择切换：商品信息抓取、价格检查、跟卖信息抓取。
+GUI 顶部通过功能选择切换：商品信息抓取、商品链接提取、商品图片处理、价格检查、跟卖信息抓取。
 
 ## 断点续跑
 
@@ -70,5 +70,5 @@ pyinstaller --noconfirm --onedir --windowed --clean --name "Worten爬虫控制�
 ## 验证
 
 ```bash
-python -m py_compile product_info.py price_check.py more_seller.py worten_gui.py state_store.py excel_schemas.py
+python -m py_compile product_images.py worten_gui.py excel_schemas.py product_info.py product_links.py price_check.py more_seller.py state_store.py excel_io.py url_classifier.py
 ```
